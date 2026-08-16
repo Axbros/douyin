@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -49,7 +50,7 @@ class AutoUpdater:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
 
-            latest = data.get("tag_name", "").lstrip("v")
+            latest = data.get("tag_name", "").removeprefix("v")
             result["latest_version"] = latest
             result["release_notes"] = data.get("body", "")
 
@@ -69,11 +70,48 @@ class AutoUpdater:
                             result["download_url"] = asset.get("browser_download_url")
                             break
 
-        except Exception as e:
-            result["error"] = str(e)
-            print(f"[Updater] 检查更新失败: {e}")
+        except Exception as api_err:
+            # API 不可用（常见：匿名限流 403 rate limit、网络超时）时，
+            # 用 releases/latest 的 302 重定向兜底拿版本号，不受 API 配额限制
+            try:
+                latest = self._latest_tag_via_redirect()
+                result["latest_version"] = latest
+                result["release_notes"] = "（经备用通道检查，更新内容详见发布页）"
+                if self._compare_versions(latest, self.current_version) > 0:
+                    result["has_update"] = True
+            except Exception:
+                result["error"] = str(api_err)
+                print(f"[Updater] 检查更新失败: {api_err}")
 
         return result
+
+    def _latest_tag_via_redirect(self) -> str:
+        """通过 github.com/{repo}/releases/latest 的 302 Location 解析最新 tag
+
+        GitHub 会把该 URL 重定向到 /releases/tag/vX.Y.Z，无需 API 配额。
+        """
+        req = urllib.request.Request(
+            f"https://github.com/{self.repo}/releases/latest",
+            headers={"User-Agent": "LiveCompanion-Updater/1.0"},
+        )
+
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = urllib.request.build_opener(_NoRedirect)
+        try:
+            with opener.open(req, timeout=10):
+                # 没有 302 说明仓库没有 release，视为无法解析
+                raise ValueError("releases/latest 未发生重定向（仓库可能没有发布版本）")
+        except urllib.error.HTTPError as e:
+            if e.code not in (301, 302, 303, 307, 308):
+                raise
+            location = e.headers.get("Location", "")
+        tag = location.rstrip("/").rsplit("/", 1)[-1].removeprefix("v")
+        if not tag or not tag[0].isdigit():
+            raise ValueError(f"无法从重定向解析版本号: {location}")
+        return tag
 
     def download_installer(self, url: str, progress_callback=None) -> str:
         """下载installer到临时目录

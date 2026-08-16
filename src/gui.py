@@ -359,16 +359,26 @@ class EngineWorker(QObject):
             import traceback
             traceback.print_exc()
         finally:
+            # 先复位 _stopping 再发信号，防止 10 秒兜底定时器把 stopped 二次发射
+            self._stopping = False
             self.stopped.emit()
+            try:
+                asyncio.set_event_loop(None)
+                self._loop.close()
+            except Exception:
+                pass
 
     async def _run_manager(self):
         """启动 EngineManager，并把主引擎暴露到 self.engine 供外部热更新配置"""
+        def _expose_master():
+            self.engine = next(
+                (e for e in self.manager.engines if e.role == "master"),
+                self.manager.engines[0] if self.manager.engines else None
+            )
+        # start() 的 gather 会阻塞到全部引擎停止；引擎列表就绪回调让主引擎立即可用
+        self.manager.on_engines_ready = _expose_master
         await self.manager.start()
-        # 找到主引擎，外部代码（_on_settings 的热更新）通过 self.engine 访问
-        self.engine = next(
-            (e for e in self.manager.engines if e.role == "master"),
-            self.manager.engines[0] if self.manager.engines else None
-        )
+        _expose_master()
 
     def _emit_status(self, msg):
         self.status_changed.emit(msg)
@@ -914,6 +924,13 @@ class _LoginWorker(QObject):
             self.stopped.emit()
 
     async def _do_login(self):
+        try:
+            await self._do_login_impl()
+        finally:
+            # 超时/异常/取消路径统一关浏览器，否则每次扫码登录泄漏一个 Chromium 进程
+            await self._cleanup()
+
+    async def _do_login_impl(self):
         from playwright.async_api import async_playwright
         from src.platforms import create_platform
         plat = create_platform(self.platform_name)
@@ -1841,6 +1858,13 @@ class MiniCompanionWindow(QWidget):
         self.btn_expand.setStyleSheet("QPushButton { background-color: transparent; border: none; color: #6b7280; font-size: 16px; padding: 0; } QPushButton:hover { color: #111827; }")
         self.btn_expand.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_expand.clicked.connect(self._expand)
+
+        self.btn_log = QPushButton("📄")
+        self.btn_log.setFixedSize(28, 28)
+        self.btn_log.setStyleSheet("QPushButton { background-color: transparent; border: none; color: #6b7280; font-size: 14px; padding: 0; } QPushButton:hover { color: #111827; }")
+        self.btn_log.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_log.setToolTip("查看运行日志")
+        self.btn_log.clicked.connect(self._open_log)
         
         self.btn_stop = QPushButton("⏹")
         self.btn_stop.setFixedSize(28, 28)
@@ -1852,6 +1876,7 @@ class MiniCompanionWindow(QWidget):
         bg_layout.addSpacing(8)
         bg_layout.addWidget(self.scroll_text, 1)
         bg_layout.addWidget(self.btn_expand)
+        bg_layout.addWidget(self.btn_log)
         bg_layout.addWidget(self.btn_stop)
         
         layout.addWidget(self.bg_frame)
@@ -1871,6 +1896,16 @@ class MiniCompanionWindow(QWidget):
         self.hide()
         if self.parent_main:
             self.parent_main.show()
+
+    def closeEvent(self, event):
+        # 悬浮舱没有独立的"关闭"语义：Alt+F4 或系统关闭时恢复主界面，
+        # 而不是真关掉悬浮舱（否则主窗口仍隐藏，程序看起来"消失"）
+        event.ignore()
+        self._expand()
+
+    def _open_log(self):
+        if self.parent_main:
+            self.parent_main._show_log_viewer()
 
     def _stop(self):
         if self.parent_main:
@@ -2227,6 +2262,9 @@ class MainWindow(QMainWindow):
         # 引擎运行中不允许切换
         if self._worker and self._thread and self._thread.isRunning():
             CustomMessageBox.warning(self, "提示", "请先停止当前引擎再切换平台")
+            # 滑块已在 mouseReleaseEvent 里翻过去，回滚到当前平台的显示
+            if hasattr(self, 'platform_switcher'):
+                self.platform_switcher.set_platform(self.current_platform)
             return
 
         self.current_platform = name
@@ -2292,6 +2330,9 @@ class MainWindow(QMainWindow):
         if self._worker:
             self._worker.stop_engine()
             self._append_log("正在停止引擎...", "#ff9800")
+            # 立即恢复主界面给反馈，不等引擎真正停止（浏览器关闭可能耗时数秒）
+            self.mini_companion.hide()
+            self.show()
 
     @pyqtSlot()
     def _on_engine_stopped(self):
@@ -2309,6 +2350,8 @@ class MainWindow(QMainWindow):
 
         # 异步退出线程（带超时，不阻塞 GUI）
         if self._thread:
+            # 线程真正结束后再析构 C++ 对象，避免运行中析构导致未定义行为
+            self._thread.finished.connect(self._thread.deleteLater)
             self._thread.quit()
             # wait 最多 2 秒，超时就放弃（线程资源会在进程退出时释放）
             self._thread.wait(2000)
@@ -2374,9 +2417,12 @@ class MainWindow(QMainWindow):
                 # 热更新：如果引擎正在运行，实时更新配置
                 if self._worker and self._worker.engine:
                     try:
-                        self._worker.engine.config = self.config
-                        if hasattr(self._worker.engine, 'llm_client') and self._worker.engine.llm_client:
-                            self._worker.engine.llm_client.update_config(self.config.get("llm", {}))
+                        # 提交到引擎事件循环内执行，避免 GUI 线程直接改引擎对象/LLM客户端的竞态
+                        fut = asyncio.run_coroutine_threadsafe(
+                            self._worker.engine.apply_hot_config(self.config),
+                            self._worker._loop,
+                        )
+                        fut.result(timeout=3)
                         self._append_log("配置已热更新（立即生效）", "#4caf50")
                     except Exception as e:
                         self._append_log(f"热更新失败: {e}，重启后生效", "#ff9800")
@@ -2402,6 +2448,9 @@ class MainWindow(QMainWindow):
         # 防止重复检查（自动检查未完成时用户又手动点击）
         if hasattr(self, '_update_thread') and self._update_thread and self._update_thread.isRunning():
             if not silent:
+                # 先关旧的 loading 再建新的，否则旧对话框失去引用后永远不会被关闭
+                if getattr(self, '_update_loading', None):
+                    self._update_loading.close()
                 self._update_loading = self._show_loading("正在检查更新...")
             return
         
@@ -2559,11 +2608,16 @@ class MainWindow(QMainWindow):
         )
         self._download_worker.finished.connect(self._on_download_finished)
         self._download_worker.finished.connect(self._download_thread.quit)
+        self._download_cancelled = False
+        progress.canceled.connect(lambda: setattr(self, "_download_cancelled", True))
         progress.canceled.connect(self._download_thread.quit)
         self._download_thread.start()
 
     def _on_download_finished(self, installer_path: str):
         """下载完成，执行安装"""
+        # 用户已取消下载：quit 只是停了线程事件循环，阻塞中的下载仍会跑完并触发本回调
+        if getattr(self, "_download_cancelled", False):
+            return
         if not installer_path:
             CustomMessageBox.warning(self, "更新失败", "下载失败，请稍后重试或前往 GitHub 手动下载")
             return
@@ -2618,7 +2672,11 @@ class MainWindow(QMainWindow):
         self._log_dialog.activateWindow()
 
     def closeEvent(self, event):
-        # 触发停止（现已非阻塞），不等待引擎清理，让窗口立即关闭
+        # 触发停止并给引擎线程最多 3 秒收尾，避免进程退出时
+        # "QThread: Destroyed while thread is still running" 和 Chromium 进程残留
         if self._worker:
             self._worker.stop_engine()
+        if self._thread:
+            self._thread.quit()
+            self._thread.wait(3000)
         event.accept()

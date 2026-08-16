@@ -96,6 +96,22 @@ class DanmuReader:
         # 立即注册WebSocket监听器，必须在页面加载前注册
         self.page.on("websocket", self._on_websocket)
 
+    def attach_page(self, page):
+        """切换到新标签页：更新引用并重新注册监听
+
+        新标签页上没有旧页面的 websocket 监听器和 JS hook（add_init_script 是
+        page 级的），不重新注册的话切换直播间后弹幕采集双通道都会静默失效。
+        """
+        self.page = page
+        try:
+            page.on("websocket", self._on_websocket)
+        except Exception:
+            pass
+        try:
+            page.add_init_script(WS_HOOK_JS)
+        except Exception:
+            pass
+
     async def start(self, callback):
         """开始监听弹幕
 
@@ -264,3 +280,9 @@ class DanmuReader:
     def stop(self):
         self._running = False
         self._ws_connected = False
+        # 移除websocket监听器，避免复用reader时产生双份回调
+        try:
+            if self.page:
+                self.page.remove_listener("websocket", self._on_websocket)
+        except Exception:
+            pass

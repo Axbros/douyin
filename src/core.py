@@ -94,6 +94,12 @@ class LiveCompanionEngine:
         with open(self.config_path, "w", encoding="utf-8") as f:
             yaml.dump(self.config, f, allow_unicode=True, default_flow_style=False)
 
+    async def apply_hot_config(self, config: dict):
+        """GUI 热更新配置：在引擎事件循环内执行，避免 GUI 线程直接改引擎对象的竞态"""
+        self.config = config
+        if self._llm:
+            self._llm.update_config(config.get("llm", {}))
+
     async def _load_saved_cookies(self) -> list:
         """从本地文件加载已保存的Cookie"""
         if self.cookie_file.exists():
@@ -337,7 +343,7 @@ class LiveCompanionEngine:
                             self._page = new_page
                             # 同步弹幕采集器的 page 引用
                             if self._danmu_reader:
-                                self._danmu_reader.page = self._page
+                                self._danmu_reader.attach_page(self._page)
                             # 同步评论发送器的 page 引用（否则 sender 还在用首页 page，找不到 room_id 和输入框）
                             if self._sender:
                                 self._sender.page = self._page
@@ -353,7 +359,7 @@ class LiveCompanionEngine:
                 if current_url != last_url:
                     print(f"[Core] URL变化: {current_url}")
                     # 只对关键 URL 变化输出到 GUI，避免刷屏
-                    if room_pattern.search(current_url) or "about:blank" not in current_url:
+                    if room_pattern.search(current_url) or not current_url.startswith("about:"):
                         self._emit_status(f"当前页面: {current_url[:80]}")
                     last_url = current_url
                 # 放宽检测：只要不在首页/搜索页，就认为可能进入了直播间
@@ -496,7 +502,7 @@ class LiveCompanionEngine:
         if not self._page or self._page.is_closed():
             return ""
         try:
-            urls = await self._page.evaluate("""() => {
+            urls = await self._page.evaluate(r"""() => {
                 const found = [];
                 const add = value => {
                     if (value && typeof value === 'string' && !value.startsWith('blob:')) {
@@ -649,7 +655,7 @@ class LiveCompanionEngine:
                                 self._page = new_page
                                 # 同步弹幕采集器和评论发送器的 page 引用
                                 if self._danmu_reader:
-                                    self._danmu_reader.page = new_page
+                                    self._danmu_reader.attach_page(new_page)
                                 if self._sender:
                                     self._sender.page = new_page
                                 # 注册监听器到新 page
@@ -713,7 +719,7 @@ class LiveCompanionEngine:
                                         monitored_page = new_page
                                         self._page = new_page
                                         if self._danmu_reader:
-                                            self._danmu_reader.page = new_page
+                                            self._danmu_reader.attach_page(new_page)
                                         if self._sender:
                                             self._sender.page = new_page
                                         new_page.on("response", handle_response)
@@ -816,17 +822,18 @@ class LiveCompanionEngine:
                     # 临时覆盖LLM的max_tokens
                     original_max_tokens = self._llm.max_tokens
                     self._llm.max_tokens = dynamic_max_tokens
-
-                    # LLM生成评论
-                    # 调用前再检查一次 is_running，确保停止时尽快退出（LLM 有 30s 超时）
-                    if not self.is_running:
-                        break
-                    self._emit_status("正在生成评论...")
-                    comment = await asyncio.to_thread(
-                        self._llm.generate_comment, context, danmu_context, recent_comments
-                    )
-                    # 恢复原始max_tokens
-                    self._llm.max_tokens = original_max_tokens
+                    try:
+                        # LLM生成评论
+                        # 调用前再检查一次 is_running，确保停止时尽快退出（LLM 有 30s 超时）
+                        if not self.is_running:
+                            break
+                        self._emit_status("正在生成评论...")
+                        comment = await asyncio.to_thread(
+                            self._llm.generate_comment, context, danmu_context, recent_comments
+                        )
+                    finally:
+                        # 恢复原始max_tokens（取消/异常路径也要恢复，否则共享LLM的token上限被永久压死）
+                        self._llm.max_tokens = original_max_tokens
 
                     if not comment:
                         self._emit_status("LLM未生成评论，跳过")

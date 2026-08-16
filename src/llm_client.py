@@ -61,7 +61,7 @@ class LLMClient:
         if danmu_context:
             user_content += f"\n\n最近弹幕：{danmu_context}"
         if recent_comments:
-            user_content += f"\n\n你最近发过的评论（不要重复，要换话题或换角度）：{recent_comments}"
+            user_content += f"\n\n你最近发过的评论（不要重复，要换话题或换角度）：{'、'.join(recent_comments)}"
 
         messages = [{"role": "system", "content": self.system_prompt}]
         # 保留最近的对话历史
@@ -99,8 +99,10 @@ class LLMClient:
             return ""
 
     def update_config(self, config: dict):
-        """更新配置并重建客户端"""
+        """更新配置并重建客户端（保留对话历史，热更新不丢失上下文）"""
+        history = self.conversation_history
         self.__init__(config)
+        self.conversation_history = history
 
     def clear_history(self):
         """清除对话历史"""

@@ -38,12 +38,17 @@ class EngineManager:
         self.on_comment: Callable[[str], None] = None
         self.on_error: Callable[[str], None] = None
         self.on_room_switch: Callable = None
+        # 引擎列表就绪回调（start 内 gather 之前触发，GUI 用它尽早拿到主引擎做热更新）
+        self.on_engines_ready: Callable = None
+        self._config_load_error: str = ""
 
     def _load_config(self) -> dict:
         try:
             with open(self.config_path, "r", encoding="utf-8") as f:
                 return yaml.safe_load(f) or {}
-        except Exception:
+        except Exception as e:
+            # 静默回退空配置会让多账号用户毫无感知地丢掉全部账号配置，必须提示
+            self._config_load_error = f"多账号配置读取失败，回退单账号模式: {e}"
             return {}
 
     async def start(self):
@@ -51,6 +56,8 @@ class EngineManager:
         if self.is_running:
             return
         self.is_running = True
+        if self._config_load_error:
+            self._emit_error(self._config_load_error)
 
         accounts = self.config.get("accounts", [])
         if not accounts:
@@ -70,11 +77,16 @@ class EngineManager:
             return
 
         from playwright.async_api import async_playwright
-        self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
+        try:
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.launch(
+                headless=False,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+        except Exception:
+            # 启动失败必须复位，否则 is_running 卡在 True，多账号模式一次失败后永远无法再启动
+            self.is_running = False
+            raise
 
         # ===== 创建所有引擎（共享 browser） =====
         for acc in accounts:
@@ -96,12 +108,20 @@ class EngineManager:
             self.engines.append(engine)
 
         # 主引擎的评论生成回调指向分配器
+        # 兜底选中的引擎必须补上 master 角色，否则 core.start 按 slave 分支处理，永远不会生成评论
         master = next((e for e in self.engines if e.role == "master"), self.engines[0])
+        master.role = "master"
         master.on_comment_generated = self._distribute_comment
+        # 引擎列表就绪即通知 GUI（gather 会阻塞到全部引擎停止，那时再暴露主引擎就太晚了）
+        if self.on_engines_ready:
+            self.on_engines_ready()
 
         # ===== 启动所有引擎（共享 browser 传入） =====
         tasks = [e.start(shared_browser=self._browser) for e in self.engines]
-        await asyncio.gather(*tasks)
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            self.is_running = False
 
     async def _distribute_comment(self, comment: str):
         """主引擎生成评论后调用，随机选一个已就绪引擎发送"""

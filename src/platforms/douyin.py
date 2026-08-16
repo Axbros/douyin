@@ -209,15 +209,14 @@ class DouyinPlatform(Platform):
                 pass  # 可能未压缩
 
             # Step 3: 解析 Response，提取 messages
-            response_fields = self._parse_protobuf_fields(payload_data)
-            messages_data = response_fields.get(1, b"")  # messages 字段（repeated）
+            # field 1 是 repeated bytes（一帧可能带多个 Message），必须收集全部出现，
+            # 不能用 dict 映射只留最后一个（那样多弹幕帧只剩最后一条，且层级解析全错）
+            messages = self._extract_repeated_fields(payload_data, 1)
 
-            if not messages_data:
+            if not messages:
                 return results
 
             # Step 4: 遍历 messages，提取弹幕
-            # messages 是 repeated Message，每个 Message 是一个 length-delimited 字段
-            messages = self._split_repeated_messages(messages_data)
             for msg_bytes in messages:
                 msg_fields = self._parse_protobuf_fields(msg_bytes)
                 method_bytes = msg_fields.get(1, b"")  # method
@@ -297,6 +296,35 @@ class DouyinPlatform(Platform):
             except Exception:
                 break
         return fields
+
+    @staticmethod
+    def _extract_repeated_fields(data: bytes, field_number: int) -> list[bytes]:
+        """收集指定字段号的全部 length-delimited 值（repeated 字段会出现多次）"""
+        values = []
+        i = 0
+        while i < len(data):
+            try:
+                tag, i = DouyinPlatform._read_varint(data, i)
+                num = tag >> 3
+                wire_type = tag & 0x07
+                if wire_type == 0:  # varint，跳过
+                    _, i = DouyinPlatform._read_varint(data, i)
+                elif wire_type == 2:  # length-delimited
+                    length, i = DouyinPlatform._read_varint(data, i)
+                    if i + length > len(data):
+                        break
+                    if num == field_number:
+                        values.append(data[i:i + length])
+                    i += length
+                elif wire_type == 1:
+                    i += 8
+                elif wire_type == 5:
+                    i += 4
+                else:
+                    break
+            except Exception:
+                break
+        return values
 
     @staticmethod
     def _read_varint(data: bytes, i: int) -> tuple[int, int]:
@@ -711,7 +739,7 @@ class DouyinPlatform(Platform):
                 return False, result
         except Exception as e:
             print(f"[DouyinPlatform] send_comment_via_fetch 异常: {e}")
-            return False
+            return False, {"error": f"exception:{e}"}
 
     async def send_like(self, page, live_stream_id: str = "", count: int = 1) -> tuple[bool, dict]:
         """抖音点赞：双击 video 元素触发前端点赞流程
@@ -758,11 +786,12 @@ class DouyinPlatform(Platform):
                 return False, {"error": "页面无 video 元素"}
 
             # 双击面积最大的 video 的中心点（更精确）
+            # 注意：Mouse.dblclick 只接受 x/y/delay/button，没有 timeout 参数
             rect = video_info.get("bestRect", {})
             if rect and rect.get("w", 0) > 0:
                 cx = rect["x"] + rect["w"] / 2
                 cy = rect["y"] + rect["h"] / 2
-                await page.mouse.dblclick(cx, cy, timeout=5000)
+                await page.mouse.dblclick(cx, cy)
                 return True, {"method": "mouse.dblclick", "debug_info": f"video@({cx:.0f},{cy:.0f})"}
             # 回退：直接 dblclick 选择器
             await page.dblclick('video', timeout=5000, force=True)
