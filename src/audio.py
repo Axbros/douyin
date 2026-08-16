@@ -15,6 +15,18 @@ import shutil
 import sys
 import numpy as np
 from funasr_onnx import SenseVoiceSmall
+import sentencepiece as spm
+
+# sentencepiece 在 Windows 上通过 fopen 打开模型文件，无法处理含中文（UTF-8）的路径，
+# 会报 NOT_FOUND ... Illegal byte sequence Error #42（文件实际存在）。改为内存加载：Python
+# 以 UTF-8 安全读取文件字节后经 LoadFromSerializedProto 载入，从而支持任意（含中文）安装
+# 路径，无需拷贝或改路径。
+if not getattr(spm.SentencePieceProcessor.Load, "_pangbai_patched", False):
+    def _sentencepiece_load_bytes(self, path):
+        with open(path, "rb") as f:
+            return self.LoadFromSerializedProto(f.read())
+    _sentencepiece_load_bytes._pangbai_patched = True
+    spm.SentencePieceProcessor.Load = _sentencepiece_load_bytes
 
 
 def _get_model_dir() -> str:
@@ -126,7 +138,7 @@ class AudioTranscriber:
         策略：维护最近20块的能量历史，动态计算阈值
         - 绝对阈值：低于 vad_energy_threshold 直接判定为静音
         - 动态阈值：低于最近20块能量中位数的0.3倍也判定为静音
-        - 两者取较小值（更宽松，避免误杀小声说话）
+        - 生效阈值取两者较大值（更严格，宁可漏过轻声也不放过背景噪音）
         """
         if not self.vad_enabled:
             return False
@@ -148,7 +160,7 @@ class AudioTranscriber:
             median = sorted_e[len(sorted_e) // 2]
             # 低于中位数的0.3倍视为静音（相对安静段）
             dynamic_threshold = median * 0.3
-            # 取绝对和动态阈值的较大值（更宽松）
+            # 取绝对和动态阈值的较大值（更严格）
             effective_threshold = max(self.vad_energy_threshold, dynamic_threshold)
             if rms < effective_threshold:
                 return True
@@ -161,8 +173,11 @@ class AudioTranscriber:
             self._log(f"正在加载 SenseVoiceSmall 模型: {model_dir}")
             if not _is_model_dir_valid(model_dir):
                 self._log("警告：本地未找到 ONNX 模型文件，将尝试从 ModelScope 在线下载（可能较慢）...")
-            self.model = SenseVoiceSmall(model_dir, quantize=False)
-            self._log("SenseVoiceSmall 模型加载完成")
+            # 优先使用量化模型（RAM 更低、推理更快）；若目录内无 model_quant.onnx
+            # 则回退到标准模型。两种都是从本地磁盘加载，不会触发重新下载。
+            use_quant = os.path.isfile(os.path.join(model_dir, "model_quant.onnx"))
+            self.model = SenseVoiceSmall(model_dir, quantize=use_quant)
+            self._log(f"SenseVoiceSmall 模型加载完成（{'量化' if use_quant else '标准'}）")
 
     def _load_librosa(self):
         if self._librosa is None:
@@ -400,9 +415,17 @@ class AudioTranscriber:
 
     def stop(self):
         self._running = False
+        # 停止转录时释放模型占用的内存（下次转录从本地磁盘重载，不重新下载）
+        self.model = None
         if self._process:
             try:
                 self._process.terminate()
                 self._process.wait(timeout=5)
             except Exception:
-                self._process.kill()
+                try:
+                    self._process.kill()
+                    self._process.wait(timeout=2)
+                except Exception:
+                    pass
+            finally:
+                self._process = None

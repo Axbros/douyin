@@ -22,6 +22,11 @@ a = Analysis(
         (os.path.join(os.path.expanduser('~'), '.cache', 'modelscope', 'models',
                       'manyeyes--sensevoice-small-onnx', 'snapshots', 'master', 'model.onnx'),
          os.path.join('models', 'sensevoice')),
+        # 量化版模型（INT8，约 1/4 体积、RAM 省 ~4 倍、推理快 2-3 倍）
+        # audio.py 的 _load_model 会优先使用它，缺失时自动回退 model.onnx
+        (os.path.join(os.path.expanduser('~'), '.cache', 'modelscope', 'models',
+                      'manyeyes--sensevoice-small-onnx', 'snapshots', 'master', 'model_quant.onnx'),
+         os.path.join('models', 'sensevoice')),
         (os.path.join(os.path.expanduser('~'), '.cache', 'modelscope', 'models',
                       'manyeyes--sensevoice-small-onnx', 'snapshots', 'master', 'am.mvn'),
          os.path.join('models', 'sensevoice')),
