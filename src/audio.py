@@ -14,19 +14,44 @@ import subprocess
 import shutil
 import sys
 import numpy as np
-from funasr_onnx import SenseVoiceSmall
 import sentencepiece as spm
 
 # sentencepiece 在 Windows 上通过 fopen 打开模型文件，无法处理含中文（UTF-8）的路径，
-# 会报 NOT_FOUND ... Illegal byte sequence Error #42（文件实际存在）。改为内存加载：Python
-# 以 UTF-8 安全读取文件字节后经 LoadFromSerializedProto 载入，从而支持任意（含中文）安装
-# 路径，无需拷贝或改路径。
-if not getattr(spm.SentencePieceProcessor.Load, "_pangbai_patched", False):
-    def _sentencepiece_load_bytes(self, path):
-        with open(path, "rb") as f:
-            return self.LoadFromSerializedProto(f.read())
-    _sentencepiece_load_bytes._pangbai_patched = True
-    spm.SentencePieceProcessor.Load = _sentencepiece_load_bytes
+# 会报 NOT_FOUND ... Error #2 / #42（文件实际存在）。
+# 原因：sentencepiece 模块加载时通过 _add_snake_case 自动生成了 load = Load 和 load_from_file = LoadFromFile，
+# 且 funasr_onnx 调用的是 self.sp.load()。如果仅 patch Load，sp.load() 和 sp.load_from_file()
+# 仍指向未 patch 的 C++ 原生底层方法。
+# 修复：同时 patch LoadFromFile、load_from_file、Load、load 为 Python 内存二进制读取后经 LoadFromSerializedProto 载入。
+def _sentencepiece_load_from_file(self, filename):
+    with open(filename, "rb") as f:
+        return self.LoadFromSerializedProto(f.read())
+
+
+def _sentencepiece_load(self, model_file=None, model_proto=None):
+    if model_file and model_proto:
+        raise ValueError("model_file and model_proto must be exclusive.")
+    if model_proto:
+        return self.LoadFromSerializedProto(model_proto)
+    if model_file:
+        return self.LoadFromFile(model_file)
+    raise ValueError("Either model_file or model_proto must be specified.")
+
+
+if not getattr(spm.SentencePieceProcessor, "_pangbai_patched", False):
+    spm.SentencePieceProcessor.LoadFromFile = _sentencepiece_load_from_file
+    spm.SentencePieceProcessor.load_from_file = _sentencepiece_load_from_file
+    spm.SentencePieceProcessor.Load = _sentencepiece_load
+    spm.SentencePieceProcessor.load = _sentencepiece_load
+    spm.SentencePieceProcessor._pangbai_patched = True
+
+if hasattr(spm, "SentencePieceNormalizer") and not getattr(spm.SentencePieceNormalizer, "_pangbai_patched", False):
+    spm.SentencePieceNormalizer.LoadFromFile = _sentencepiece_load_from_file
+    spm.SentencePieceNormalizer.load_from_file = _sentencepiece_load_from_file
+    spm.SentencePieceNormalizer.Load = _sentencepiece_load
+    spm.SentencePieceNormalizer.load = _sentencepiece_load
+    spm.SentencePieceNormalizer._pangbai_patched = True
+
+from funasr_onnx import SenseVoiceSmall
 
 
 def _get_model_dir() -> str:

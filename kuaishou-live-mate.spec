@@ -10,36 +10,37 @@ os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 
 block_cipher = None
 
+def _find_sensevoice_dir():
+    candidates = [
+        os.path.abspath(os.path.join('models', 'sensevoice')),
+        os.path.join(os.path.expanduser('~'), '.cache', 'modelscope', 'models',
+                      'manyeyes--sensevoice-small-onnx', 'snapshots', 'master'),
+        os.path.abspath(os.path.join('dist', '旁白', '_internal', 'models', 'sensevoice')),
+        os.path.join(os.environ.get('USERPROFILE', os.path.expanduser('~')), 'Documents', '旁白', '旁白', '_internal', 'models', 'sensevoice'),
+    ]
+    for c in candidates:
+        if os.path.isdir(c) and any(f.endswith('.onnx') for f in os.listdir(c)):
+            return c
+    return os.path.abspath(os.path.join('models', 'sensevoice'))
+
+_sv_dir = _find_sensevoice_dir()
+
+_datas = [
+    ('config.example.yaml', '.'),
+    ('src/kuaishou_pb2.py', 'src'),
+    ('logo.png', '.'),
+]
+
+for _fname in ['model.onnx', 'model_quant.onnx', 'am.mvn', 'config.yaml', 'chn_jpn_yue_eng_ko_spectok.bpe.model', 'tokens.json']:
+    _fpath = os.path.join(_sv_dir, _fname)
+    if os.path.isfile(_fpath):
+        _datas.append((_fpath, os.path.join('models', 'sensevoice')))
+
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[
-        ('config.example.yaml', '.'),
-        ('src/kuaishou_pb2.py', 'src'),
-        ('logo.png', '.'),
-        # SenseVoiceSmall ONNX 模型文件
-        (os.path.join(os.path.expanduser('~'), '.cache', 'modelscope', 'models',
-                      'manyeyes--sensevoice-small-onnx', 'snapshots', 'master', 'model.onnx'),
-         os.path.join('models', 'sensevoice')),
-        # 量化版模型（INT8，约 1/4 体积、RAM 省 ~4 倍、推理快 2-3 倍）
-        # audio.py 的 _load_model 会优先使用它，缺失时自动回退 model.onnx
-        (os.path.join(os.path.expanduser('~'), '.cache', 'modelscope', 'models',
-                      'manyeyes--sensevoice-small-onnx', 'snapshots', 'master', 'model_quant.onnx'),
-         os.path.join('models', 'sensevoice')),
-        (os.path.join(os.path.expanduser('~'), '.cache', 'modelscope', 'models',
-                      'manyeyes--sensevoice-small-onnx', 'snapshots', 'master', 'am.mvn'),
-         os.path.join('models', 'sensevoice')),
-        (os.path.join(os.path.expanduser('~'), '.cache', 'modelscope', 'models',
-                      'manyeyes--sensevoice-small-onnx', 'snapshots', 'master', 'config.yaml'),
-         os.path.join('models', 'sensevoice')),
-        (os.path.join(os.path.expanduser('~'), '.cache', 'modelscope', 'models',
-                      'manyeyes--sensevoice-small-onnx', 'snapshots', 'master', 'chn_jpn_yue_eng_ko_spectok.bpe.model'),
-         os.path.join('models', 'sensevoice')),
-        (os.path.join(os.path.expanduser('~'), '.cache', 'modelscope', 'models',
-                      'manyeyes--sensevoice-small-onnx', 'snapshots', 'master', 'tokens.json'),
-         os.path.join('models', 'sensevoice')),
-    ],
+    datas=_datas,
     hiddenimports=[
         'PyQt6.QtWidgets',
         'PyQt6.QtCore',

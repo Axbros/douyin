@@ -1528,9 +1528,9 @@ def main():
 
     print("\n" + "=" * 60)
     if _FAIL == 0:
-        print("✓ 全部通过，可以打包发布")
+        print("[OK] 全部通过，可以打包发布")
     else:
-        print(f"✗ 有 {_FAIL} 项失败，必须修复后再打包")
+        print(f"[FAIL] 有 {_FAIL} 项失败，必须修复后再打包")
     print("=" * 60)
 
     return 0 if _FAIL == 0 else 1

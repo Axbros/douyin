@@ -6,7 +6,7 @@
 
 ### 直播间 AI 互动助手（快手 + 抖音）
 
-[![Version](https://img.shields.io/badge/version-1.1.1-blue.svg)](https://github.com/atvkh/kuaishou-live-mate/releases)
+[![Version](https://img.shields.io/badge/version-1.1.2-blue.svg)](https://github.com/atvkh/kuaishou-live-mate/releases)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey.svg)](https://github.com/atvkh/kuaishou-live-mate/releases)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10--3.12-yellow.svg)](https://www.python.org/)
