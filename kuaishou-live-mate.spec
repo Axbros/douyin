@@ -31,7 +31,8 @@ _datas = [
     ('logo.png', '.'),
 ]
 
-for _fname in ['model.onnx', 'model_quant.onnx', 'am.mvn', 'config.yaml', 'chn_jpn_yue_eng_ko_spectok.bpe.model', 'tokens.json']:
+# 仅打包 INT8 量化模型（227MB，内存省57%、推理快2倍），不打包893MB的未量化原版模型
+for _fname in ['model_quant.onnx', 'am.mvn', 'config.yaml', 'chn_jpn_yue_eng_ko_spectok.bpe.model', 'tokens.json']:
     _fpath = os.path.join(_sv_dir, _fname)
     if os.path.isfile(_fpath):
         _datas.append((_fpath, os.path.join('models', 'sensevoice')))
@@ -75,7 +76,22 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        'matplotlib',
+        'pandas',
+        'jedi',
+        'IPython',
+        'notebook',
+        'nbformat',
+        'nbconvert',
+        'jupyter_client',
+        'jupyter_core',
+        'tornado',
+        'sqlite3',
+        'pydoc',
+        'tkinter',
+        'unittest',
+    ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
