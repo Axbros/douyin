@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QMessageBox, QSplitter, QCheckBox,
     QProgressDialog, QMenu, QMenuBar, QFrame, QGraphicsDropShadowEffect,
     QApplication, QGraphicsOpacityEffect, QListWidget, QListWidgetItem,
-    QButtonGroup
+    QButtonGroup, QFileDialog
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, pyqtSlot, QTimer, QPoint, QPropertyAnimation, pyqtProperty, QRect, QEasingCurve
 from PyQt6.QtGui import QTextCursor, QIcon, QColor, QPixmap, QPainter
@@ -313,6 +313,7 @@ class EngineWorker(QObject):
         self._loop = None
         self._stopping = False
         self._stop_triggered = False  # 防止重复触发停止
+        self._main_task = None
 
     @pyqtSlot()
     def run(self):
@@ -341,7 +342,8 @@ class EngineWorker(QObject):
                 self.manager.on_room_switch = self._emit_room_switch
                 # 兼容：外部代码通过 self.engine 访问时，指向主引擎
                 # （EngineManager.start 完成后会填充 engines 列表，这里在协程内同步赋值）
-                self._loop.run_until_complete(self._run_manager())
+                self._main_task = self._loop.create_task(self._run_manager())
+                self._loop.run_until_complete(self._main_task)
             else:
                 # 单账号模式：保持原逻辑
                 self.engine = LiveCompanionEngine(self.config_path)
@@ -351,7 +353,10 @@ class EngineWorker(QObject):
                 self.engine.on_comment = self._emit_comment
                 self.engine.on_error = self._emit_error
                 self.engine.on_room_switch = self._emit_room_switch
-                self._loop.run_until_complete(self.engine.start())
+                self._main_task = self._loop.create_task(self.engine.start())
+                self._loop.run_until_complete(self._main_task)
+        except asyncio.CancelledError:
+            pass  # 停止时主任务被取消，仍须执行 finally 清理
         except Exception as e:
             if self._stopping and "Event loop stopped before Future completed" in str(e):
                 return
@@ -359,14 +364,31 @@ class EngineWorker(QObject):
             import traceback
             traceback.print_exc()
         finally:
-            # 先复位 _stopping 再发信号，防止 10 秒兜底定时器把 stopped 二次发射
-            self._stopping = False
-            self.stopped.emit()
             try:
+                if self._loop and not self._loop.is_closed():
+                    self._loop.run_until_complete(self._shutdown())
+                    self._loop.run_until_complete(self._loop.shutdown_asyncgens())
+                    self._loop.run_until_complete(self._loop.shutdown_default_executor())
+            finally:
                 asyncio.set_event_loop(None)
-                self._loop.close()
-            except Exception:
-                pass
+                if self._loop and not self._loop.is_closed():
+                    self._loop.close()
+                self._stopping = False
+                self.stopped.emit()
+
+    async def _shutdown(self):
+        """关闭资源，再排空事件循环中的剩余任务，最后才能通知 GUI。"""
+        try:
+            target = self.manager if self.manager else self.engine
+            if target:
+                await target.stop()
+        finally:
+            pending = [task for task in asyncio.all_tasks()
+                       if task is not asyncio.current_task()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
     async def _run_manager(self):
         """启动 EngineManager，并把主引擎暴露到 self.engine 供外部热更新配置"""
@@ -407,17 +429,7 @@ class EngineWorker(QObject):
         if target and self._loop and self._loop.is_running():
             self._stopping = True
             self._stop_triggered = True
-            asyncio.run_coroutine_threadsafe(target.stop(), self._loop)
-            # 兜底定时器：若 10 秒内 stopped 信号未发出（stop 协程卡死），
-            # 主动发 stopped 信号强制恢复 GUI，防止悬浮舱永远卡在"正在停止引擎..."
-            from PyQt6.QtCore import QTimer
-            QTimer.singleShot(10000, self._force_stop_fallback)
-
-    def _force_stop_fallback(self):
-        """兜底：stop 协程未在超时内完成时强制通知 GUI"""
-        if self._stopping:
-            self._stopping = False
-            self.stopped.emit()
+            self._loop.call_soon_threadsafe(self._main_task.cancel)
 
 
 class PromptEditDialog(QDialog):
@@ -1329,7 +1341,7 @@ class SettingsDialog(QDialog):
         sender_layout.addRow("", like_row)
 
         # AI评论生成开关
-        self.comment_enabled_check = ToggleSwitch("启用 AI 评论生成")
+        self.comment_enabled_check = ToggleSwitch("启用自动评论")
         self.comment_enabled_check.setChecked(True)  # 默认开启
         sender_layout.addRow("", self.comment_enabled_check)
 
@@ -1339,13 +1351,45 @@ class SettingsDialog(QDialog):
         tab2_layout.addStretch()
         self.tabs.addTab(tab2, "互动控制")
 
+        text_tab = QWidget()
+        text_layout = QVBoxLayout(text_tab)
+        text_layout.setContentsMargins(20, 20, 20, 20)
+        source_row = QHBoxLayout()
+        source_row.addWidget(QLabel("评论来源:"))
+        self.comment_source_combo = QComboBox()
+        self.comment_source_combo.addItem("AI 根据直播内容生成", "ai")
+        self.comment_source_combo.addItem("从导入文本随机选择", "text")
+        source_row.addWidget(self.comment_source_combo)
+        source_row.addStretch()
+        text_layout.addLayout(source_row)
+        hint = QLabel("每行一条评论，可导入多个 TXT 文件或直接粘贴。空行和重复内容会自动去除。\n"
+                      "文本模式按“互动控制”的间隔随机发送，尽量避免连续重复；超长评论按字数上限截断。")
+        hint.setWordWrap(True)
+        text_layout.addWidget(hint)
+        self.comment_text_edit = QTextEditField()
+        self.comment_text_edit.setPlaceholderText("欢迎来到直播间\n今天有什么新品？\n这款有其他颜色吗？")
+        text_layout.addWidget(self.comment_text_edit)
+        import_row = QHBoxLayout()
+        import_button = QPushButton("导入 TXT（可多选）")
+        import_button.clicked.connect(self._import_comment_files)
+        import_row.addWidget(import_button)
+        clear_button = QPushButton("清空文本")
+        clear_button.clicked.connect(self.comment_text_edit.clear)
+        import_row.addWidget(clear_button)
+        self.comment_count_label = QLabel()
+        import_row.addWidget(self.comment_count_label)
+        import_row.addStretch()
+        text_layout.addLayout(import_row)
+        self.comment_text_edit.textChanged.connect(self._update_comment_count)
+        self.tabs.addTab(text_tab, "文本评论")
+
         # ===== Tab 3: 多账号管理 =====
         tab3 = QWidget()
         tab3_layout = QVBoxLayout(tab3)
         tab3_layout.setContentsMargins(20, 20, 20, 20)
 
         accounts_hint = QLabel(
-            "通过添加多个账号实现热场效果：主账号采集直播内容并生成评论，副账号只负责发评论。\n"
+            "多账号模式下，每个账号可绑定不同抖音直播间和专属话术；当前暂不加载语音模型。\n"
             "点击「登录新账号」会弹出浏览器，扫码登录后自动保存登录状态，下次启动免扫码。\n"
             "添加时不区分角色，启动时若没有 master 会自动把第一个账号当主号；也可在右侧手动指定。\n"
             "不配置任何账号则自动使用单账号模式。"
@@ -1393,6 +1437,15 @@ class SettingsDialog(QDialog):
         self.acc_role_combo = QComboBox()
         self.acc_role_combo.addItems(["Master (主控账号，完整权限)", "Slave (只发评论的副账号)"])
         acc_edit_layout.addRow("职能分配:", self.acc_role_combo)
+
+        self.acc_room_input = QLineEdit()
+        self.acc_room_input.setPlaceholderText("抖音直播间数字 ID，例如 123456789")
+        acc_edit_layout.addRow("目标直播间:", self.acc_room_input)
+
+        self.acc_comments_input = QTextEditField()
+        self.acc_comments_input.setPlaceholderText("该账号专属话术，每行一条；留空则使用文本评论页的公共话术")
+        self.acc_comments_input.setFixedHeight(72)
+        acc_edit_layout.addRow("专属话术:", self.acc_comments_input)
 
         # 重新登录按钮（用于已登录账号失效时刷新 cookie）
         self.acc_relogin_btn = QPushButton("🔄 重新扫码登录")
@@ -1556,6 +1609,8 @@ class SettingsDialog(QDialog):
         self.acc_name_input.blockSignals(True)
         self.acc_cookie_input.blockSignals(True)
         self.acc_role_combo.blockSignals(True)
+        self.acc_room_input.blockSignals(True)
+        self.acc_comments_input.blockSignals(True)
         self.acc_name_input.setText(data.get("name", ""))
         # 显示登录状态而非文件名
         if data.get("logged_in"):
@@ -1564,9 +1619,13 @@ class SettingsDialog(QDialog):
             self.acc_cookie_input.setText("未登录")
         role = data.get("role", "slave")
         self.acc_role_combo.setCurrentIndex(0 if role == "master" else 1)
+        self.acc_room_input.setText(str(data.get("room_id", "")))
+        self.acc_comments_input.setPlainText("\n".join(data.get("text_comments", [])))
         self.acc_name_input.blockSignals(False)
         self.acc_cookie_input.blockSignals(False)
         self.acc_role_combo.blockSignals(False)
+        self.acc_room_input.blockSignals(False)
+        self.acc_comments_input.blockSignals(False)
 
     def _sync_current_account(self):
         """把右侧输入框（名称、role）回写到当前选中条目（cookie 状态不通过手填改）"""
@@ -1581,11 +1640,14 @@ class SettingsDialog(QDialog):
         old_data = item.data(Qt.ItemDataRole.UserRole) or {}
         role = "master" if self.acc_role_combo.currentIndex() == 0 else "slave"
         name = self.acc_name_input.text().strip() or "未命名"
+        from src.comment_pool import parse_comments
         new_data = {
             "name": name,
             "cookie_file": old_data.get("cookie_file", "cookies.json"),
             "role": role,
             "logged_in": old_data.get("logged_in", False),
+            "room_id": self.acc_room_input.text().strip(),
+            "text_comments": parse_comments(self.acc_comments_input.toPlainText()),
         }
         item.setData(Qt.ItemDataRole.UserRole, new_data)
         self._refresh_account_item_text(item)
@@ -1623,6 +1685,11 @@ class SettingsDialog(QDialog):
         self.like_interval_spin.setValue(int(sender.get("like_interval", 5)))
         # AI评论生成
         self.comment_enabled_check.setChecked(sender.get("comment_enabled", True))
+
+        source_index = self.comment_source_combo.findData(sender.get("comment_source", "ai"))
+        self.comment_source_combo.setCurrentIndex(max(0, source_index))
+        self.comment_text_edit.setPlainText("\n".join(sender.get("text_comments", [])))
+        self._update_comment_count()
 
         # 多账号列表
         self.accounts_list.clear()
@@ -1680,12 +1747,47 @@ class SettingsDialog(QDialog):
         self.vision_base_url_input.setText(vision.get("base_url", ""))
         self.vision_base_url_input.setEnabled(vision_provider == "custom")
 
+    def _update_comment_count(self):
+        from src.comment_pool import parse_comments
+        count = len(parse_comments(self.comment_text_edit.toPlainText()))
+        self.comment_count_label.setText(f"共 {count} 条评论")
+
+    def _import_comment_files(self):
+        from src.comment_pool import parse_comments, read_comments
+        paths, _ = QFileDialog.getOpenFileNames(self, "导入评论文本", "", "文本文件 (*.txt)")
+        if not paths:
+            return
+        comments = parse_comments(self.comment_text_edit.toPlainText())
+        errors = []
+        imported = False
+        for path in paths:
+            try:
+                lines = read_comments(path)
+                comments.extend(lines)
+                imported = imported or bool(lines)
+            except (OSError, UnicodeError, ValueError) as e:
+                errors.append(f"{os.path.basename(path)}: {e}")
+        self.comment_text_edit.setPlainText("\n".join(dict.fromkeys(comments)))
+        if imported:
+            self.comment_source_combo.setCurrentIndex(self.comment_source_combo.findData("text"))
+        if errors:
+            QMessageBox.warning(self, "部分文件导入失败", "\n".join(errors))
+
     def _open_prompt_editor(self):
         dialog = PromptEditDialog(self.system_prompt_input.toPlainText(), self)
         if dialog.exec():
             self.system_prompt_input.setPlainText(dialog.get_text())
 
     def _save(self):
+        from src.comment_pool import parse_comments
+        text_comments = parse_comments(self.comment_text_edit.toPlainText())
+        if (self.comment_enabled_check.isChecked()
+                and self.comment_source_combo.currentData() == "text" and not text_comments):
+            QMessageBox.warning(self, "缺少评论文本", "请先导入或填写至少一条评论。")
+            return
+        if self.min_interval_spin.value() > self.max_interval_spin.value():
+            QMessageBox.warning(self, "发送间隔有误", "最小间隔不能大于最大间隔。")
+            return
         provider = "custom" if self.provider_combo.currentIndex() == 1 else "dashscope"
         model_map = {0: "tiny", 1: "base", 2: "small", 3: "medium", 4: "large"}
         self.config["llm"] = {
@@ -1706,6 +1808,8 @@ class SettingsDialog(QDialog):
             "like_enabled": self.like_enabled_check.isChecked(),
             "like_interval": self.like_interval_spin.value(),
             "comment_enabled": self.comment_enabled_check.isChecked(),
+            "comment_source": self.comment_source_combo.currentData(),
+            "text_comments": text_comments,
         }
         # 多账号：先回写当前编辑中的条目，再收集全部
         self._sync_current_account()
@@ -1717,6 +1821,9 @@ class SettingsDialog(QDialog):
                 "name": data.get("name", "未命名"),
                 "cookie_file": data.get("cookie_file", "cookies.json"),
                 "role": data.get("role", "slave"),
+                "room_id": data.get("room_id", ""),
+                "text_comments": data.get("text_comments", []),
+                "comment_source": "text" if data.get("text_comments") else self.config.get("sender", {}).get("comment_source", "text"),
             })
         # 空列表不写入，避免覆盖配置时留下空段
         if accounts:

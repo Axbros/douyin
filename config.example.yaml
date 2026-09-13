@@ -36,13 +36,23 @@ sender:
   suffix_text: '[AI]'        # 后缀内容（可自定义）
   like_enabled: true         # 启用自动点赞（双击 video 触发，默认开启）
   like_interval: 3           # 点赞间隔秒数（快手+抖音均验证通过，3 秒稳定）
-  comment_enabled: true      # 启用 AI 评论生成（关闭后仅采集+点赞，不生成评论）
+  comment_enabled: true      # 启用自动评论
+  comment_source: ai         # ai=AI生成；text=从文本库随机选择
+  text_comments: []          # 每项一条评论，可在“文本评论”设置中批量导入 TXT
 
 # 多账号配置（可选，不配置则单账号模式）
 # accounts:
 #   - name: "主账号"
 #     cookie_file: "cookies_main.json"
 #     role: master            # master=主账号(完整功能), slave=副账号(仅发送)
+#     room_id: "123456789"   # 账号自动进入的抖音直播间 ID
+#     sender:
+#       comment_source: text
+#       text_comments: ["这款怎么样？", "有其他颜色吗？"]
 #   - name: "副账号1"
 #     cookie_file: "cookies_slave1.json"
 #     role: slave
+#     room_id: "987654321"
+#     sender:
+#       comment_source: text
+#       text_comments: ["已关注", "看起来不错"]

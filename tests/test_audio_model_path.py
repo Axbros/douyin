@@ -22,6 +22,8 @@ class ModelPathTest(unittest.TestCase):
             model_dir = bundle_dir / "models" / "sensevoice"
             model_dir.mkdir(parents=True)
             (model_dir / "model.onnx").write_bytes(b"onnx")
+            for name in ("config.yaml", "am.mvn", "chn_jpn_yue_eng_ko_spectok.bpe.model"):
+                (model_dir / name).touch()
 
             executable = Path(temp_dir) / "旁白.exe"
             with (

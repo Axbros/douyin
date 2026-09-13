@@ -18,12 +18,23 @@ from src import APP_DIR, DATA_DIR
 
 
 class LiveCompanionEngine:
-    def __init__(self, config_path: str = None, cookie_file: str = "cookies.json", role: str = "master"):
+    def __init__(self, config_path: str = None, cookie_file: str = "cookies.json", role: str = "master", account_config: dict = None):
         # 默认配置路径：保存在用户数据目录
         if config_path is None:
             config_path = str(DATA_DIR / "config.yaml")
         self.config_path = config_path
         self.config = self._load_config()
+        self.account_config = account_config or {}
+        # 账号级设置覆盖全局设置，避免多账号共享同一直播间/话术。
+        if self.account_config:
+            self.config = dict(self.config)
+            self.config["sender"] = {
+                **self.config.get("sender", {}),
+                **self.account_config.get("sender", {}),
+            }
+            for key in ("room_id", "room_url", "comment_source", "text_comments", "min_interval", "max_interval"):
+                if key in self.account_config:
+                    self.config["sender"][key] = self.account_config[key]
 
         # 账号隔离
         self.cookie_file = DATA_DIR / cookie_file  # 每个账号独立 Cookie 文件
@@ -36,6 +47,8 @@ class LiveCompanionEngine:
 
         # 状态
         self.is_running = False
+        self._tasks = set()
+        self._stop_task = None
         self.danmu_list = []       # 最近的弹幕文本（用于LLM上下文）
         self.transcription = ""    # 最近的语音转录（保留最新一条，兼容旧逻辑）
         self.transcription_history = []  # 转录历史列表，用于评论循环检测新内容
@@ -141,21 +154,19 @@ class LiveCompanionEngine:
         self._emit_error("登录超时，请重试")
         return False
 
-    def _ensure_chromium(self):
+    async def _ensure_chromium(self):
         """检测chromium浏览器是否存在，不存在则自动下载安装"""
-        # 使用与main.py中一致的PLAYWRIGHT_BROWSERS_PATH
-        browsers_path = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH",
-                                            os.path.join(os.environ.get("LOCALAPPDATA", ""), "ms-playwright")))
-
         try:
-            # 查找已安装的chromium
-            if browsers_path.exists():
-                for item in browsers_path.iterdir():
-                    if item.name.startswith("chromium-"):
-                        chrome_exe = item / "chrome-win64" / "chrome.exe"
-                        if chrome_exe.exists():
-                            print(f"[Engine] 找到chromium: {chrome_exe}")
-                            return True
+            # 由 Playwright 解析当前系统、架构和版本对应的可执行文件路径。
+            # 使用异步 API，兼容引擎已经运行中的 asyncio 事件循环。
+            from playwright.async_api import async_playwright
+            async with async_playwright() as playwright:
+                chrome_exe = Path(playwright.chromium.executable_path)
+            if chrome_exe.is_file():
+                print(f"[Engine] 找到chromium: {chrome_exe}")
+                return True
+
+            browsers_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", str(chrome_exe.parent))
 
             # 未找到chromium，自动安装
             self._emit_status("首次运行，正在下载chromium浏览器（约150MB）...")
@@ -164,13 +175,14 @@ class LiveCompanionEngine:
             from playwright._impl._driver import compute_driver_executable
             node_exe, cli_js = compute_driver_executable()
 
-            result = subprocess.run(
+            result = await asyncio.to_thread(
+                subprocess.run,
                 [node_exe, cli_js, "install", "chromium"],
                 capture_output=True, text=True, timeout=300,
-                creationflags=subprocess.CREATE_NO_WINDOW
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
             )
 
-            if result.returncode == 0:
+            if result.returncode == 0 and chrome_exe.is_file():
                 print("[Engine] chromium下载安装成功")
                 self._emit_status("chromium浏览器安装完成")
                 return True
@@ -194,12 +206,13 @@ class LiveCompanionEngine:
         if self.is_running:
             return
 
+        self._stop_task = None
         self.is_running = True
         self._emit_status("正在初始化...")
 
         try:
             # 检测并自动安装chromium浏览器
-            if not self._ensure_chromium():
+            if not await self._ensure_chromium():
                 self.is_running = False
                 return
 
@@ -271,7 +284,15 @@ class LiveCompanionEngine:
                     return
 
             # 告诉用户进入直播间
-            self._emit_status("请在浏览器中进入目标直播间...")
+            target_url = self.account_config.get("room_url", "")
+            room_id = str(self.account_config.get("room_id", "")).strip()
+            if not target_url and room_id and self.platform.name == "douyin":
+                target_url = f"https://live.douyin.com/{room_id}"
+            if target_url:
+                self._emit_status(f"正在进入指定直播间: {target_url}")
+                await self._page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            else:
+                self._emit_status("请在浏览器中进入目标直播间...")
 
             # 拦截网络请求获取直播流URL
             # 直播流特征由 platform.is_real_stream 判断（快手/抖音各不相同）
@@ -373,6 +394,10 @@ class LiveCompanionEngine:
                         if not in_live_room:
                             in_live_room = True
                             self._emit_status("已进入直播间，等待直播流...")
+                # 预设文本不依赖直播流或语音；进入直播间后即可启动发送计时。
+                if in_live_room and self.config.get("sender", {}).get("comment_source", "ai") == "text":
+                    self._emit_status("已进入直播间，文本评论将按设置间隔随机发送")
+                    break
                 if in_live_room and not stream_url:
                     probed = await self._probe_current_stream_url()
                     if probed:
@@ -408,7 +433,7 @@ class LiveCompanionEngine:
                     # 直播流检测到后再截图，确保画面已开始播放
                     self._emit_status("直播流已检测到，等待画面加载...")
                     await asyncio.sleep(5)  # 额外等待5秒确保视频画面渲染
-                    asyncio.create_task(self._fetch_live_room_info())
+                    self._create_task(self._fetch_live_room_info())
                     break
                 # 如果检测到流但不在直播间（首页推荐直播的预览流），清除误判
                 if stream_url and not in_live_room:
@@ -436,13 +461,15 @@ class LiveCompanionEngine:
             # 把 stream_url 注入给 sender，点赞时用于提取 liveStreamId
             self._sender.set_stream_url(self._stream_url or "")
 
-            # 副账号：只保留 sender，不启动转录/弹幕/LLM/评论循环
+            # 副账号：纯文本模式也负责自己的评论任务；其它模式保持原有仅发送行为。
             if self.role == "slave":
                 self._emit_status(f"[{self.engine_id}] 副账号已就绪（仅发送模式）")
                 # 副账号也启动自动点赞（如果配置开启）
                 slave_tasks = []
+                if self.config.get("sender", {}).get("comment_source", "ai") == "text":
+                    slave_tasks.append(self._create_task(self._run_comment_loop()))
                 if self.config.get("sender", {}).get("like_enabled", True):
-                    slave_tasks.append(asyncio.create_task(self._run_like_loop()))
+                    slave_tasks.append(self._create_task(self._run_like_loop()))
                     self._emit_status(f"[{self.engine_id}] 副账号自动点赞已启动")
                 if slave_tasks:
                     await asyncio.gather(*slave_tasks)
@@ -452,12 +479,13 @@ class LiveCompanionEngine:
                         await asyncio.sleep(5)
                 return
 
-            self._transcriber = AudioTranscriber(
-                self.config.get("audio", {}),
-                referer_url=self.platform.home_url
-            )
+            if self.config.get("sender", {}).get("comment_source", "ai") != "text":
+                self._transcriber = AudioTranscriber(
+                    self.config.get("audio", {}),
+                    referer_url=self.platform.home_url
+                )
             # 如果 EngineManager 已注入共用 LLM，则不再创建
-            if self._llm is None:
+            if self._llm is None and self.config.get("sender", {}).get("comment_source", "ai") != "text":
                 self._llm = LLMClient(self.config.get("llm", {}))
             # 如果已经抓取到直播间信息，注入到LLM
             self._inject_live_context_to_llm()
@@ -466,16 +494,17 @@ class LiveCompanionEngine:
             tasks = []
 
             if self.config.get("danmu", {}).get("enabled", True):
-                tasks.append(asyncio.create_task(self._run_danmu()))
+                tasks.append(self._create_task(self._run_danmu()))
 
-            tasks.append(asyncio.create_task(self._run_audio()))
+            if self.config.get("sender", {}).get("comment_source", "ai") != "text":
+                tasks.append(self._create_task(self._run_audio()))
             # AI评论生成（默认开启，可由配置 sender.comment_enabled 关闭）
             if self.config.get("sender", {}).get("comment_enabled", True):
-                tasks.append(asyncio.create_task(self._run_comment_loop()))
+                tasks.append(self._create_task(self._run_comment_loop()))
 
             # 自动点赞任务（默认开启，可由配置 sender.like_enabled 关闭）
             if self.config.get("sender", {}).get("like_enabled", True):
-                tasks.append(asyncio.create_task(self._run_like_loop()))
+                tasks.append(self._create_task(self._run_like_loop()))
                 self._emit_status("自动点赞已启动")
 
             self._emit_status("运行中")
@@ -484,6 +513,7 @@ class LiveCompanionEngine:
 
         except Exception as e:
             self._emit_error(f"启动失败: {e}")
+        finally:
             await self.stop()
 
     async def _run_danmu(self):
@@ -692,7 +722,7 @@ class LiveCompanionEngine:
                     continue
 
                 # 启动转录任务（非阻塞）
-                transcription_task = asyncio.create_task(
+                transcription_task = self._create_task(
                     self._transcriber.start(current_url, "", on_transcription)
                 )
 
@@ -754,7 +784,7 @@ class LiveCompanionEngine:
                             # 不清除新流URL！监听器已更新为新直播间流URL
                             # 等待新画面加载后再截图
                             await asyncio.sleep(5)
-                            asyncio.create_task(self._fetch_live_room_info())
+                            self._create_task(self._fetch_live_room_info())
                             break
 
                 if not self.is_running:
@@ -762,7 +792,12 @@ class LiveCompanionEngine:
 
                 # 如果是正常退出（非切换），短暂等待后用当前URL重启
                 await asyncio.sleep(1)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self._emit_error(f"语音转录已停用，弹幕和评论继续运行: {type(e).__name__}: {e}")
         finally:
+            self._transcriber.stop()
             if monitored_page:
                 try:
                     monitored_page.remove_listener("response", handle_response)
@@ -776,8 +811,9 @@ class LiveCompanionEngine:
         min_interval = sender_config.get("min_interval", 20)
         max_interval = sender_config.get("max_interval", 50)
 
-        # 等待初始数据积累
-        await asyncio.sleep(15)
+        # 只有 AI 模式需要等待上下文积累；文本模式直接进入间隔计时。
+        if sender_config.get("comment_source", "ai") != "text":
+            await asyncio.sleep(15)
 
         # 用于评论去重
         recent_comments = []  # 最近发送过的评论（用于去重）
@@ -788,62 +824,84 @@ class LiveCompanionEngine:
 
         while self.is_running:
             try:
+                sender_config = self.config.get("sender", {})
+                min_interval = sender_config.get("min_interval", 20)
+                max_interval = max(min_interval, sender_config.get("max_interval", 50))
                 interval = random.uniform(min_interval, max_interval)
                 await asyncio.sleep(interval)
 
                 if not self.is_running:
                     break
-
-                # 构建上下文：用最近几条转录拼接，提供更完整的语境
-                recent_transcripts = self.transcription_history[-5:]
-                context = " ".join(recent_transcripts).strip()
-                danmu_context = "\n".join(self.danmu_list[-10:])
-
-                print(f"[CommentLoop] 转录={repr(context[:50])} 弹幕数={len(self.danmu_list)}")
-
-                if not context and not danmu_context:
-                    self._emit_status("无上下文数据，跳过评论生成")
+                sender_config = self.config.get("sender", {})
+                if not sender_config.get("comment_enabled", True):
                     continue
 
-                # === 真人特征1：水弹幕（15%概率跳过LLM直接发）===
-                if random.random() < 0.15:
-                    comment = random.choice(water_comments)
-                    self._emit_status(f"水弹幕: {comment}")
-                else:
-                    # === 真人特征2：长度随机分布 ===
-                    # 30%短(1-3字)，50%中(4-8字)，20%长(9-15字)
-                    rand_len = random.random()
-                    if rand_len < 0.3:
-                        dynamic_max_tokens = 10
-                    elif rand_len < 0.8:
-                        dynamic_max_tokens = 20
-                    else:
-                        dynamic_max_tokens = 35
-                    # 临时覆盖LLM的max_tokens
-                    original_max_tokens = self._llm.max_tokens
-                    self._llm.max_tokens = dynamic_max_tokens
-                    try:
-                        # LLM生成评论
-                        # 调用前再检查一次 is_running，确保停止时尽快退出（LLM 有 30s 超时）
-                        if not self.is_running:
-                            break
-                        self._emit_status("正在生成评论...")
-                        comment = await asyncio.to_thread(
-                            self._llm.generate_comment, context, danmu_context, recent_comments
-                        )
-                    finally:
-                        # 恢复原始max_tokens（取消/异常路径也要恢复，否则共享LLM的token上限被永久压死）
-                        self._llm.max_tokens = original_max_tokens
-
+                text_mode = sender_config.get("comment_source", "ai") == "text"
+                if text_mode:
+                    from src.comment_pool import choose_comment
+                    comment = choose_comment(
+                        sender_config.get("text_comments", []), recent_comments,
+                        sender_config.get("max_length", 20),
+                    )
                     if not comment:
-                        self._emit_status("LLM未生成评论，跳过")
+                        self._emit_status("文本评论库为空，请在设置中导入评论")
+                        continue
+                    self._emit_status(f"随机文本评论: {comment}")
+                else:
+                    if self._llm is None:
+                        self._llm = LLMClient(self.config.get("llm", {}))
+                        self._inject_live_context_to_llm()
+                    # 构建上下文：用最近几条转录拼接，提供更完整的语境
+                    recent_transcripts = self.transcription_history[-5:]
+                    context = " ".join(recent_transcripts).strip()
+                    danmu_context = "\n".join(self.danmu_list[-10:])
+
+                    print(f"[CommentLoop] 转录={repr(context[:50])} 弹幕数={len(self.danmu_list)}")
+
+                    if not context and not danmu_context:
+                        self._emit_status("无上下文数据，跳过评论生成")
                         continue
 
+                    # === 真人特征1：水弹幕（15%概率跳过LLM直接发）===
+                    if random.random() < 0.15:
+                        comment = random.choice(water_comments)
+                        self._emit_status(f"水弹幕: {comment}")
+                    else:
+                        # === 真人特征2：长度随机分布 ===
+                        # 30%短(1-3字)，50%中(4-8字)，20%长(9-15字)
+                        rand_len = random.random()
+                        if rand_len < 0.3:
+                            dynamic_max_tokens = 10
+                        elif rand_len < 0.8:
+                            dynamic_max_tokens = 20
+                        else:
+                            dynamic_max_tokens = 35
+                        # 临时覆盖LLM的max_tokens
+                        original_max_tokens = self._llm.max_tokens
+                        self._llm.max_tokens = dynamic_max_tokens
+                        try:
+                            # LLM生成评论
+                            # 调用前再检查一次 is_running，确保停止时尽快退出（LLM 有 30s 超时）
+                            if not self.is_running:
+                                break
+                            self._emit_status("正在生成评论...")
+                            comment = await asyncio.to_thread(
+                                self._llm.generate_comment, context, danmu_context, recent_comments
+                            )
+                        finally:
+                            # 恢复原始max_tokens（取消/异常路径也要恢复，否则共享LLM的token上限被永久压死）
+                            self._llm.max_tokens = original_max_tokens
+
+                        if not comment:
+                            self._emit_status("LLM未生成评论，跳过")
+                            continue
+
                 # 评论去重检查：与最近发送过的评论比对
-                if comment in recent_comments:
+                if not text_mode and comment in recent_comments:
                     self._emit_status(f"评论与最近发送过的重复，跳过: {comment}")
                     continue
 
+                original_comment = comment
                 # 拼接 AI 后缀标记
                 if sender_config.get("ai_suffix", False):
                     suffix = sender_config.get("suffix_text", "[AI]")
@@ -863,7 +921,7 @@ class LiveCompanionEngine:
                 if success:
                     self._emit_status(f"已发送评论: {comment}")
                     # 记录已发送评论用于去重
-                    recent_comments.append(comment)
+                    recent_comments.append(original_comment)
                     if len(recent_comments) > max_recent:
                         recent_comments = recent_comments[-max_recent:]
                 else:
@@ -1275,7 +1333,27 @@ class LiveCompanionEngine:
         base_prompt = self.config.get("llm", {}).get("system_prompt", "")
         self._llm.system_prompt = f"[直播间信息：{self._live_context}]\n\n{base_prompt}"
 
+    def _create_task(self, coroutine):
+        """持有后台任务，直到结束；停止时统一取消并等待。"""
+        task = asyncio.create_task(coroutine)
+        self._tasks.add(task)
+        task.add_done_callback(self._task_done)
+        return task
+
+    def _task_done(self, task):
+        self._tasks.discard(task)
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                self._emit_error(f"后台任务失败: {error}")
+
     async def stop(self):
+        """多个调用方共享同一次清理，避免重复关闭或中途取消清理。"""
+        if self._stop_task is None:
+            self._stop_task = asyncio.create_task(self._stop_impl())
+        await asyncio.shield(self._stop_task)
+
+    async def _stop_impl(self):
         """停止旁白"""
         self.is_running = False
 
@@ -1284,6 +1362,12 @@ class LiveCompanionEngine:
 
         if self._danmu_reader:
             self._danmu_reader.stop()
+
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         # 共享浏览器模式下，只关自己的 context，不关 browser（browser 由 EngineManager 统一关闭）
         # 各资源关闭加 3 秒超时，避免单个资源卡死拖垮整个停止流程

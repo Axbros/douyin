@@ -1,0 +1,15 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+sqlalchemy>=2.0
+greenlet>=3.0
+asyncmy>=0.2
+alembic>=1.13
+redis>=5.0
+pydantic-settings>=2.4
+PyJWT>=2.9
+passlib[argon2]>=1.7
+cryptography>=43.0
+python-multipart>=0.0.9
+playwright>=1.40
+protobuf>=4.24
+pyyaml>=6.0

@@ -13,6 +13,7 @@ import re
 import subprocess
 import shutil
 import sys
+from src import DATA_DIR
 import numpy as np
 import sentencepiece as spm
 
@@ -54,45 +55,33 @@ if hasattr(spm, "SentencePieceNormalizer") and not getattr(spm.SentencePieceNorm
 from funasr_onnx import SenseVoiceSmall
 
 
+MODEL_ID = "iic/SenseVoiceSmall-onnx"
+MODEL_ASSETS = ("config.yaml", "am.mvn", "chn_jpn_yue_eng_ko_spectok.bpe.model")
+
+
 def _get_model_dir() -> str:
-    """获取 SenseVoiceSmall ONNX 模型路径"""
-    # 1. 开发环境：modelscope 缓存
-    cache_dir = os.path.join(
-        os.path.expanduser("~"),
-        ".cache", "modelscope", "models",
-        "manyeyes--sensevoice-small-onnx", "snapshots", "master"
-    )
-    # 检查目录下是否存在任意 .onnx 文件（model.onnx 或 model_quant.onnx 等）
-    if os.path.isdir(cache_dir):
-        for f in os.listdir(cache_dir):
-            if f.endswith(".onnx"):
-                return cache_dir
-    # 2. PyInstaller 打包环境：资源位于 _MEIPASS（onedir 默认为 _internal）
+    """优先使用完整的本地模型；缺失或下载未完成时返回官方模型 ID。"""
+    candidates = [os.path.join(
+        os.path.expanduser("~"), ".cache", "modelscope", "models",
+        "manyeyes--sensevoice-small-onnx", "snapshots", "master",
+    )]
     bundle_root = getattr(sys, "_MEIPASS", None)
     if bundle_root:
-        bundled = os.path.join(bundle_root, "models", "sensevoice")
-        if os.path.isdir(bundled):
-            for f in os.listdir(bundled):
-                if f.endswith(".onnx"):
-                    return bundled
-    # 3. 兼容将资源放在 exe 同目录的打包方式
-    exe_dir = os.path.dirname(os.path.abspath(sys.argv[0])) if hasattr(sys, 'argv') else os.getcwd()
-    bundled = os.path.join(exe_dir, "models", "sensevoice")
-    if os.path.isdir(bundled):
-        for f in os.listdir(bundled):
-            if f.endswith(".onnx"):
-                return bundled
-    # 4. 默认返回 modelscope ID（首次会自动下载，但需要 funasr 导出 onnx）
-    return "manyeyes/sensevoice-small-onnx"
+        candidates.append(os.path.join(bundle_root, "models", "sensevoice"))
+    exe_dir = os.path.dirname(os.path.abspath(sys.argv[0])) if sys.argv else os.getcwd()
+    candidates.extend([
+        os.path.join(exe_dir, "models", "sensevoice"),
+        str(DATA_DIR / "models" / "sensevoice"),
+    ])
+    return next((path for path in candidates if _is_model_dir_valid(path)), MODEL_ID)
 
 
 def _is_model_dir_valid(model_dir: str) -> bool:
-    """检查模型目录是否包含 onnx 文件（区分本地路径和 modelscope ID）"""
-    if model_dir.startswith("manyeyes/") or model_dir.startswith("iic/"):
-        return False  # modelscope ID，需要在线下载
-    return os.path.isdir(model_dir) and any(
-        f.endswith(".onnx") for f in os.listdir(model_dir)
-    )
+    """模型、配置和分词器均存在时才可离线加载。"""
+    return (os.path.isdir(model_dir)
+            and all(os.path.isfile(os.path.join(model_dir, name)) for name in MODEL_ASSETS)
+            and any(os.path.isfile(os.path.join(model_dir, name))
+                    for name in ("model_quant.onnx", "model.onnx")))
 
 
 def _clean_sensevoice_output(text: str) -> str:
@@ -196,8 +185,34 @@ class AudioTranscriber:
         if self.model is None:
             model_dir = _get_model_dir()
             self._log(f"正在加载 SenseVoiceSmall 模型: {model_dir}")
-            if not _is_model_dir_valid(model_dir):
-                self._log("警告：本地未找到 ONNX 模型文件，将尝试从 ModelScope 在线下载（可能较慢）...")
+            if model_dir == MODEL_ID:
+                self._log("本地未找到 ONNX 模型文件，正在从 ModelScope 下载（首次可能较慢）...")
+                # 显式下载，避免 funasr_onnx 内部用 raise 字符串掩盖原始错误。
+                try:
+                    from modelscope.hub.snapshot_download import snapshot_download
+                except ImportError as e:
+                    raise RuntimeError("模型下载依赖 modelscope 不可用，请使用运行程序的 Python 安装 requirements.txt") from e
+                try:
+                    from modelscope.hub.file_download import model_file_download
+                    destination = str(DATA_DIR / "models" / "sensevoice")
+                    model_dir = snapshot_download(
+                        model_dir, local_dir=destination,
+                        allow_file_pattern=["model_quant.onnx", "config.yaml", "am.mvn"],
+                    )
+                    # ONNX 发布包不含 Python 推理器需要的分词器，从原模型获取。
+                    tokenizer = model_file_download(
+                        "iic/SenseVoiceSmall", "chn_jpn_yue_eng_ko_spectok.bpe.model",
+                    )
+                    shutil.copy2(tokenizer, os.path.join(model_dir, "chn_jpn_yue_eng_ko_spectok.bpe.model"))
+                except Exception as e:
+                    raise RuntimeError(f"SenseVoice 模型下载失败: {type(e).__name__}: {e}") from e
+            required = MODEL_ASSETS
+            missing = [name for name in required if not os.path.isfile(os.path.join(model_dir, name))]
+            if not any(os.path.isfile(os.path.join(model_dir, name))
+                       for name in ("model_quant.onnx", "model.onnx")):
+                missing.append("model_quant.onnx 或 model.onnx")
+            if missing:
+                raise RuntimeError(f"SenseVoice 模型文件不完整（{model_dir}）: {', '.join(missing)}")
             # 优先使用量化模型（RAM 更低、推理更快）；若目录内无 model_quant.onnx
             # 则回退到标准模型。两种都是从本地磁盘加载，不会触发重新下载。
             use_quant = os.path.isfile(os.path.join(model_dir, "model_quant.onnx"))
@@ -226,9 +241,14 @@ class AudioTranscriber:
             return
 
         self._log(f"开始转录，流地址: {stream_url[:80]}...")
-        self._load_model()
+        # 下载和初始化模型在工作线程执行，避免阻塞弹幕和浏览器事件。
+        await asyncio.to_thread(self._load_model)
+        if not self._running:
+            return
         if self.enable_diarization:
-            self._load_librosa()
+            await asyncio.to_thread(self._load_librosa)
+        if not self._running:
+            return
 
         cmd = ["ffmpeg", "-y", "-loglevel", "warning"]
         headers = ""
@@ -258,7 +278,7 @@ class AudioTranscriber:
         try:
             probe = subprocess.run(
                 probe_cmd, capture_output=True, text=True, timeout=10,
-                creationflags=subprocess.CREATE_NO_WINDOW
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
             )
             probe_err = probe.stderr
             self._log(f"流探测信息:\n{probe_err[:800]}")
@@ -274,7 +294,7 @@ class AudioTranscriber:
         try:
             self._process = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                creationflags=subprocess.CREATE_NO_WINDOW
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
             )
         except Exception as e:
             self._log(f"FFmpeg启动失败: {e}")

@@ -6,8 +6,9 @@ os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 # 屏蔽huggingface_hub的symlinks警告（Windows不支持符号链接，回退到普通缓存即可）
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 # 关键：指定Playwright浏览器安装路径到用户目录，避免打包后找不到浏览器
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(
-    os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ms-playwright")
+os.environ.setdefault(
+    "PLAYWRIGHT_BROWSERS_PATH",
+    os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ms-playwright"),
 )
 
 import sys

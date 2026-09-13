@@ -66,12 +66,14 @@ class EngineManager:
 
         # 创建共用 LLM（主账号和副账号共用，节省 API 费用）
         llm_config = self.config.get("llm", {})
-        self._llm = LLMClient(llm_config)
+        # 多账号当前为纯文本任务，不初始化共享 LLM。
+        if not accounts and self.config.get("sender", {}).get("comment_source", "ai") != "text":
+            self._llm = LLMClient(llm_config)
 
         # ===== 启动 1 个共享浏览器进程 =====
         # 先用主 engine 的 _ensure_chromium 检测/安装 chromium
         probe = LiveCompanionEngine(self.config_path)
-        if not probe._ensure_chromium():
+        if not await probe._ensure_chromium():
             self._emit_error("chromium 检测失败，无法启动多账号模式")
             self.is_running = False
             return
@@ -94,7 +96,14 @@ class EngineManager:
                 self.config_path,
                 cookie_file=acc.get("cookie_file", "cookies.json"),
                 role=acc.get("role", "slave"),
+                account_config=acc,
             )
+            # 当前多账号阶段只做“进入指定房间 + 预设话术发送”，禁用语音/弹幕采集。
+            # 账号有专属话术时优先使用；否则回退到全局文本库。
+            engine.config.setdefault("sender", {})["comment_source"] = "text"
+            if not engine.config["sender"].get("text_comments"):
+                engine.config["sender"]["text_comments"] = self.config.get("sender", {}).get("text_comments", [])
+            engine.config.setdefault("danmu", {})["enabled"] = False
             engine.engine_id = acc.get("name", "未命名")
             # 共用 LLM
             engine._llm = self._llm
@@ -111,7 +120,13 @@ class EngineManager:
         # 兜底选中的引擎必须补上 master 角色，否则 core.start 按 slave 分支处理，永远不会生成评论
         master = next((e for e in self.engines if e.role == "master"), self.engines[0])
         master.role = "master"
-        master.on_comment_generated = self._distribute_comment
+        # 绑定独立直播间的账号必须自己发送，不能把评论随机分发给其它房间。
+        # 只有旧的“同房间主从协同”模式才使用随机分发器。
+        has_individual_rooms = any(
+            acc.get("room_id") or acc.get("room_url") for acc in accounts
+        )
+        if not has_individual_rooms:
+            master.on_comment_generated = self._distribute_comment
         # 引擎列表就绪即通知 GUI（gather 会阻塞到全部引擎停止，那时再暴露主引擎就太晚了）
         if self.on_engines_ready:
             self.on_engines_ready()

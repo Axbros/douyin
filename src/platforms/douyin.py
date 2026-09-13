@@ -13,6 +13,7 @@
 """
 
 import gzip
+import re
 import struct
 import time
 from typing import Optional
@@ -156,6 +157,31 @@ class DouyinPlatform(Platform):
             """)
         except Exception:
             return False
+
+    async def click_login_button(self, page) -> bool:
+        """打开登录面板。
+
+        抖音前端的 CSS class/id 可能每次发布都变化，因此优先使用可访问名称和
+        可见文本定位，最后才使用 p 标签文本作为兜底。返回是否成功点击。
+        """
+        candidates = [
+            page.get_by_role("button", name="登录", exact=True),
+            page.get_by_text("登录", exact=True),
+            page.locator("p").filter(has_text=re.compile(r"^\s*登录\s*$")),
+        ]
+        for locator in candidates:
+            try:
+                count = await locator.count()
+                for index in range(count):
+                    item = locator.nth(index)
+                    if await item.is_visible() and await item.is_enabled():
+                        await item.click(timeout=5000)
+                        print("[DouyinPlatform] 已点击登录按钮", flush=True)
+                        return True
+            except Exception as exc:
+                print(f"[DouyinPlatform] 登录按钮候选定位失败: {type(exc).__name__}: {exc}", flush=True)
+        print("[DouyinPlatform] 未找到可点击的登录按钮，继续等待页面", flush=True)
+        return False
 
     def parse_danmu_payload(self, data: bytes) -> list[tuple[str, str]]:
         """解析抖音 Protobuf 弹幕（基于真实抓包数据 2026-07-26）
