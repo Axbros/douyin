@@ -120,7 +120,7 @@ class ScriptBatchReviewRequest(BaseModel):
 
 
 class TaskCreate(BaseModel):
-    room_id: str = Field(min_length=1, max_length=100)
+    live_share_text: str = Field(min_length=1, max_length=2000)
     script_ids: list[int] = Field(min_length=1)
     min_interval_seconds: int = Field(default=20, ge=5, le=3600)
     max_interval_seconds: int = Field(default=50, ge=5, le=3600)
@@ -132,7 +132,7 @@ class TaskCreate(BaseModel):
 class TaskResponse(BaseModel):
     id: int
     customer_id: int
-    room_id: str
+    live_url: str
     status: str
     target_account_count: int
     account_source: str
@@ -152,7 +152,7 @@ class CommentLogResponse(BaseModel):
     id: int
     task_id: int
     account_id: int
-    room_id: str
+    live_url: str
     content: str
     result: str
     failure_code: str | None = None

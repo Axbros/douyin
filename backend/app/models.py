@@ -97,7 +97,7 @@ class AccountLog(TimestampMixin, Base):
 class Task(TimestampMixin, Base):
     __tablename__ = "tasks"
     customer_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
-    room_id: Mapped[str] = mapped_column(String(100))
+    live_url: Mapped[str] = mapped_column(String(500))
     status: Mapped[str] = mapped_column(String(20), default="pending")
     target_account_count: Mapped[int] = mapped_column(Integer, default=3)
     account_source: Mapped[str] = mapped_column(String(20), default="platform")
@@ -159,7 +159,7 @@ class CommentLog(TimestampMixin, Base):
     __tablename__ = "comment_logs"
     task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id"))
     account_id: Mapped[int] = mapped_column(ForeignKey("douyin_accounts.id"))
-    room_id: Mapped[str] = mapped_column(String(100))
+    live_url: Mapped[str] = mapped_column(String(500))
     content: Mapped[str] = mapped_column(String(500))
     result: Mapped[str] = mapped_column(String(40))
     failure_code: Mapped[str | None] = mapped_column(String(100), nullable=True)

@@ -47,11 +47,11 @@
 
 ### 任务
 
-- 新建任务：直播间 ID、选择已审核话术、发送间隔、目标账号数量。
+- 新建任务：粘贴直播分享内容、选择已审核话术、发送间隔、目标账号数量。
 - 默认分配数量由后台配置，初始值为 3。
 - 查看任务状态：`pending`、`running`、`paused`、`stopped`、`failed`。
 - 暂停、恢复、停止任务。
-- 查看任务日志：时间、直播间 ID、执行账号、评论内容、结果和失败原因。
+- 查看任务日志：时间、直播链接、执行账号、评论内容、结果和失败原因。
 - 客户只能看到自己的任务、话术和日志，不能看到账号 Cookie 或其他客户数据。
 
 ## 4. 管理端 PC Web
@@ -75,7 +75,7 @@
 
 ### 任务和账号分配
 
-- 查看全部客户任务、来源客户、直播间 ID、任务状态和分配账号。
+- 查看全部客户任务、来源客户、直播链接、任务状态和分配账号。
 - 客户创建任务后，事务内锁定并随机选择 N 个闲置账号，N 默认 3，可后台配置。
 - 管理员可以手动添加、移除任务执行账号。
 - 账号必须满足：启用、登录有效、未被其他互斥任务占用、所属平台正确。
@@ -111,7 +111,7 @@ scripts
 - review_reason, reviewed_by, reviewed_at, created_at, updated_at
 
 tasks
-- id, customer_id, room_id, status
+- id, customer_id, live_url, status
 - target_account_count, min_interval, max_interval
 - started_at, paused_at, stopped_at, created_at, updated_at
 
@@ -122,7 +122,7 @@ task_accounts
 - task_id, account_id, status, assigned_at, removed_at
 
 comment_logs
-- id, task_id, account_id, room_id, content
+- id, task_id, account_id, live_url, content
 - result, failure_code, sensitive_word, sent_at, created_at
 
 account_logs
@@ -152,11 +152,11 @@ system_settings
 
 ## 7. 任务执行流程
 
-1. 客户提交直播间 ID和话术列表。
+1. 客户粘贴抖音直播分享内容并提交话术列表，服务端提取和校验直播链接。
 2. API 校验话术全部为 `approved`，否则拒绝创建任务。
 3. PostgreSQL 事务创建任务并锁定 N 个可用账号；不足则任务进入 `pending`。
 4. 调度器为每个任务账号投递 Worker 作业。
-5. Worker 解密并恢复账号状态，进入 `https://live.douyin.com/{room_id}`。
+5. Worker 解密并恢复账号状态，直接访问任务保存的抖音直播链接并跟随短链跳转。
 6. 按任务的随机间隔从话术池选取一条，进行敏感词检查。
 7. 未命中敏感词才发送；无论成功、失败或拦截都写 `comment_logs`。
 8. 暂停时停止发送并保留账号分配；停止时关闭页面、释放账号并结束作业。
@@ -249,7 +249,7 @@ DELETE /api/admin/sensitive-words/{id}
 
 - 客户登录。
 - 话术导入、编辑和审核状态。
-- 直播任务创建、暂停、恢复和停止。
+- 粘贴抖音直播分享内容创建任务，以及任务暂停、恢复和停止。
 - 任务日志和评论结果查询。
 
 ### 运维交付

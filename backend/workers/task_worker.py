@@ -60,7 +60,7 @@ def find_sensitive_word(content: str, words):
 from src.platforms import create_platform
 
 
-async def run_account(task_id: int, assignment_id: int, account_id: int, room_id: str, worker_id: int):
+async def run_account(task_id: int, assignment_id: int, account_id: int, live_url: str, worker_id: int):
     platform = create_platform("douyin")
     playwright = browser = context = None
     failed = False
@@ -81,13 +81,13 @@ async def run_account(task_id: int, assignment_id: int, account_id: int, room_id
         browser = await playwright.chromium.launch(headless=os.getenv("PLAYWRIGHT_HEADLESS", "false").lower() == "true")
         context = await browser.new_context(storage_state=state)
         page = await context.new_page()
-        await page.goto(f"{platform.home_url}/{room_id}", wait_until="domcontentloaded", timeout=30000)
+        await page.goto(live_url, wait_until="domcontentloaded", timeout=30000)
         if not await platform.check_logged_in(page, context):
             raise LoginStateExpired("登录状态已失效，请重新扫码登录")
         async with SessionLocal() as db:
-            db.add(AccountLog(account_id=account_id, event_type="task_browser_started", detail={"task_id": task_id, "room_id": room_id}))
+            db.add(AccountLog(account_id=account_id, event_type="task_browser_started", detail={"task_id": task_id, "live_url": live_url}))
             await db.commit()
-        print(f"[TaskWorker] 账号 {account_id} 已进入直播间 {room_id}，任务 {task_id}", flush=True)
+        print(f"[TaskWorker] 账号 {account_id} 已打开直播链接 {live_url}，任务 {task_id}", flush=True)
         async with SessionLocal() as db:
             scripts = list(await db.scalars(select(Script).join(
                 TaskScript, TaskScript.script_id == Script.id
@@ -142,7 +142,7 @@ async def run_account(task_id: int, assignment_id: int, account_id: int, room_id
             if matched_word:
                 async with SessionLocal() as db:
                     db.add(CommentLog(
-                        task_id=task_id, account_id=account_id, room_id=room_id,
+                        task_id=task_id, account_id=account_id, live_url=live_url,
                         content=script.content, result="blocked_sensitive", sensitive_word=matched_word,
                     ))
                     await db.commit()
@@ -151,7 +151,7 @@ async def run_account(task_id: int, assignment_id: int, account_id: int, room_id
             ok = await sender.send_comment(script.content)
             async with SessionLocal() as db:
                 db.add(CommentLog(
-                    task_id=task_id, account_id=account_id, room_id=room_id,
+                    task_id=task_id, account_id=account_id, live_url=live_url,
                     content=script.content, result="sent" if ok else "failed",
                     sent_at=datetime.now(),
                 ))
@@ -219,7 +219,7 @@ async def run_task(task_id: int, worker_id: int):
         task.started_at = datetime.now()
         await db.commit()
     await asyncio.gather(*(
-        run_account(task_id, a.id, a.account_id, task.room_id, worker_id) for a in assignments
+        run_account(task_id, a.id, a.account_id, task.live_url, worker_id) for a in assignments
     ))
     async with SessionLocal() as db:
         task = await db.get(Task, task_id)
@@ -248,7 +248,7 @@ async def run_added_assignment(assignment_id: int, worker_id: int):
         task = await db.get(Task, assignment.task_id)
         if not task or task.status not in {"running", "paused"}:
             return
-        arguments = (task.id, assignment.id, assignment.account_id, task.room_id)
+        arguments = (task.id, assignment.id, assignment.account_id, task.live_url)
     await run_account(*arguments, worker_id)
 
 

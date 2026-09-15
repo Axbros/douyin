@@ -7,6 +7,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db, redis_client
+from app.core.douyin_urls import extract_douyin_live_url
 from app.core.platform_settings import get_platform_settings
 from app.core.subscriptions import get_customer_plan
 from app.dependencies import customer_user
@@ -305,6 +306,10 @@ async def delete_script(script_id: int, user: Annotated[User, Depends(customer_u
 @router.post("/tasks", response_model=TaskResponse, status_code=201)
 async def create_task(payload: TaskCreate, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
     platform_settings = await get_platform_settings(db)
+    try:
+        live_url = extract_douyin_live_url(payload.live_share_text)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     # 锁定客户行，避免同一客户并发请求同时创建多个活动任务。
     locked_user = await db.scalar(select(User).where(User.id == user.id).with_for_update())
     plan = await get_customer_plan(db, locked_user)
@@ -358,7 +363,7 @@ async def create_task(payload: TaskCreate, user: Annotated[User, Depends(custome
         ).order_by(func.rand()).limit(target_account_count).with_for_update()))
         if len(accounts) < target_account_count:
             raise HTTPException(409, f"平台可用抖音账号不足，需要 {target_account_count} 个，当前只有 {len(accounts)} 个")
-    task = Task(customer_id=user.id, room_id=payload.room_id, target_account_count=target_account_count,
+    task = Task(customer_id=user.id, live_url=live_url, target_account_count=target_account_count,
                 account_source=payload.account_source,
                 script_order_mode=payload.script_order_mode,
                 min_interval_seconds=payload.min_interval_seconds, max_interval_seconds=payload.max_interval_seconds)
