@@ -312,6 +312,51 @@ async def find_login_password_context(page, context=None):
 
 async def click_verification_button(container, input_box=None) -> bool:
     try:
+        if input_box is not None:
+            # 管理员提供的实测 XPath优先；第二个定位不依赖 body 下动态弹层序号，
+            # 从当前密码框所属 article 精确找到页脚里的主按钮。
+            exact_buttons = (
+                input_box.locator(
+                    "xpath=/html/body/div[40]/div/div/article/div[3]/div[1]/div[2]"
+                ),
+                input_box.locator(
+                    "xpath=ancestor::article[1]//div[contains(@class, 'footer_container-')]"
+                    "//div[contains(@class, 'primary-') and normalize-space(.)='验证']"
+                ),
+            )
+            for candidates in exact_buttons:
+                for index in range(await candidates.count()):
+                    button = candidates.nth(index)
+                    if not await button.is_visible():
+                        continue
+                    text = " ".join((await button.inner_text()).split())
+                    class_name = await button.get_attribute("class") or ""
+                    if text != "验证" or not (
+                        "verification_component_btn-" in class_name or "primary-" in class_name
+                    ):
+                        continue
+                    for _ in range(30):
+                        class_name = await button.get_attribute("class") or ""
+                        if "disabled-" not in class_name:
+                            break
+                        await asyncio.sleep(0.1)
+                    try:
+                        if "disabled-" in class_name:
+                            await button.evaluate("element => element.click()")
+                            print(
+                                "[LoginWorker] 验证按钮仍为 disabled，已按精确 XPath直接触发",
+                                flush=True,
+                            )
+                        else:
+                            await button.click(timeout=3000)
+                            print("[LoginWorker] 已按精确 XPath点击验证按钮", flush=True)
+                        return True
+                    except Exception as exc:
+                        print(
+                            f"[LoginWorker] 精确 XPath点击验证按钮失败: "
+                            f"{type(exc).__name__}: {exc}",
+                            flush=True,
+                        )
         # 密码验证页可能还有其他“验证”文字。从已经填写的输入框开始，优先
         # 点击它后方最近的按钮，确保命中输入框底部的提交操作。
         if input_box is not None:
@@ -449,6 +494,30 @@ async def fill_and_submit_password(container, password: str, input_box=None) -> 
                 password,
             )
             await asyncio.sleep(0.3)
+        # 即便输入框的 DOM value 已显示密码，React 的内部 value tracker 仍可能
+        # 保留空值，使提交按钮一直处于 disabled。重置 tracker 后重新派发事件。
+        await input_box.evaluate(
+            """(element, value) => {
+                const setter = Object.getOwnPropertyDescriptor(
+                    HTMLInputElement.prototype, 'value'
+                )?.set;
+                if (setter) {
+                    setter.call(element, '');
+                    if (element._valueTracker) element._valueTracker.setValue('');
+                    setter.call(element, value);
+                } else {
+                    element.value = value;
+                }
+                element.dispatchEvent(new InputEvent('input', {
+                    bubbles: true,
+                    inputType: 'insertText',
+                    data: value,
+                }));
+                element.dispatchEvent(new Event('change', { bubbles: true }));
+            }""",
+            password,
+        )
+        await asyncio.sleep(0.5)
         if await input_box.input_value() != password:
             print("[LoginWorker] 登录密码写入后被页面清空，停止点击验证", flush=True)
             return False
