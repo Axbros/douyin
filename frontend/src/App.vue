@@ -89,9 +89,6 @@ const selectedAdminScripts = ref<any[]>([])
 const batchReviewLoading = ref(false)
 const subscriptionPlans = ref<any[]>([])
 const planSavingId = ref<number | null>(null)
-const adminPurchaseOrders = ref<any[]>([])
-const purchaseOrderStatus = ref('')
-const purchaseOrderKeyword = ref('')
 const customerMe = ref<any>(null)
 const customerScripts = ref<any[]>([])
 const customerTasks = ref<any[]>([])
@@ -132,6 +129,7 @@ const platformSettings = ref({
   qr_expire_minutes: 5,
   worker_heartbeat_timeout_seconds: 20,
   account_reclaim_seconds: 60,
+  extra_account_quota_price_cents: 0,
 })
 
 const filteredAccounts = computed(() => accounts.value.filter(account =>
@@ -151,10 +149,6 @@ const filteredCustomers = computed(() => customers.value.filter(customer =>
 const filteredScripts = computed(() => adminScripts.value.filter(script =>
   (!scriptKeyword.value || script.title.includes(scriptKeyword.value) || script.content.includes(scriptKeyword.value) || script.customer_login.includes(scriptKeyword.value)) &&
   (!scriptStatus.value || script.status === scriptStatus.value),
-))
-const filteredPurchaseOrders = computed(() => adminPurchaseOrders.value.filter(order =>
-  (!purchaseOrderStatus.value || order.status === purchaseOrderStatus.value) &&
-  (!purchaseOrderKeyword.value || order.order_no.includes(purchaseOrderKeyword.value) || customerName(order.customer_id).includes(purchaseOrderKeyword.value)),
 ))
 const paginatedAccounts = computed(() => filteredAccounts.value.slice((accountPage.value - 1) * accountPageSize.value, accountPage.value * accountPageSize.value))
 const paginatedTasks = computed(() => filteredTasks.value.slice((taskPage.value - 1) * taskPageSize.value, taskPage.value * taskPageSize.value))
@@ -302,7 +296,7 @@ async function load() {
   if (role.value !== 'admin') return
   loading.value = true
   try {
-    const [accountResponse, taskResponse, wordResponse, customerResponse, scriptResponse, settingResponse, planResponse, orderResponse] = await Promise.all([
+    const [accountResponse, taskResponse, wordResponse, customerResponse, scriptResponse, settingResponse, planResponse] = await Promise.all([
       fetch('/api/admin/douyin-accounts', { headers: authHeaders() }),
       fetch('/api/admin/tasks', { headers: authHeaders() }),
       fetch('/api/admin/sensitive-words', { headers: authHeaders() }),
@@ -310,7 +304,6 @@ async function load() {
       fetch('/api/admin/scripts', { headers: authHeaders() }),
       fetch('/api/admin/platform-settings', { headers: authHeaders() }),
       fetch('/api/admin/subscription-plans', { headers: authHeaders() }),
-      fetch('/api/admin/purchase-orders', { headers: authHeaders() }),
     ])
     if (accountResponse.ok) accounts.value = await accountResponse.json()
     if (taskResponse.ok) tasks.value = await taskResponse.json()
@@ -319,8 +312,7 @@ async function load() {
     if (scriptResponse.ok) adminScripts.value = await scriptResponse.json()
     if (settingResponse.ok) platformSettings.value = await settingResponse.json()
     if (planResponse.ok) subscriptionPlans.value = await planResponse.json()
-    if (orderResponse.ok) adminPurchaseOrders.value = await orderResponse.json()
-    if ([accountResponse, taskResponse, wordResponse, customerResponse, scriptResponse, settingResponse, planResponse, orderResponse].some(response => response.status === 401)) logout()
+    if ([accountResponse, taskResponse, wordResponse, customerResponse, scriptResponse, settingResponse, planResponse].some(response => response.status === 401)) logout()
   } finally { loading.value = false }
 }
 
@@ -347,7 +339,6 @@ async function saveSubscriptionPlan(plan: any) {
       max_active_tasks: plan.max_active_tasks,
       max_scripts_per_task: plan.max_scripts_per_task,
       price_cents: plan.price_cents,
-      extra_account_price_cents: plan.extra_account_price_cents,
       enabled: plan.enabled,
     }
     const response = await fetch(`/api/admin/subscription-plans/${plan.id}`, { method: 'PATCH', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
@@ -775,38 +766,24 @@ async function createCustomerTask() {
     createTaskVisible.value = false; notify('直播任务创建成功', 'success'); customerActive.value = 'tasks'; await loadCustomer()
   } finally { createTaskLoading.value = false }
 }
-async function requestPlanUpgrade(plan: any) {
+async function createPlanOrder(plan: any) {
   if (plan.tier_level <= (currentPlan.value?.tier_level || 0)) return
-  const confirmed = await ElMessageBox.confirm(`申请升级到${plan.name}？平台确认价格后将为您开通。`, '升级套餐', { confirmButtonText: '提交申请', cancelButtonText: '取消', type: 'info' }).catch(() => false)
+  const confirmed = await ElMessageBox.confirm(`确认创建${plan.name}购买订单，金额 ¥${(plan.price_cents / 100).toFixed(2)}？`, '购买套餐', { confirmButtonText: '创建订单', cancelButtonText: '取消', type: 'info' }).catch(() => false)
   if (!confirmed) return
   purchaseSubmitting.value = true
   try {
     const response = await fetch('/api/customer/purchase-orders', { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ order_type: 'plan_upgrade', plan_id: plan.id }) })
-    if (!response.ok) { notify((await response.json()).detail || '提交升级申请失败', 'error'); return }
-    notify('套餐升级申请已提交', 'success'); await loadCustomer()
+    if (!response.ok) { notify((await response.json()).detail || '创建套餐订单失败', 'error'); return }
+    notify('套餐订单已创建，等待支付', 'success'); await loadCustomer()
   } finally { purchaseSubmitting.value = false }
 }
 async function requestAccountQuota() {
   purchaseSubmitting.value = true
   try {
     const response = await fetch('/api/customer/purchase-orders', { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ order_type: 'account_quota', quota_quantity: quotaPurchaseQuantity.value }) })
-    if (!response.ok) { notify((await response.json()).detail || '提交额度购买申请失败', 'error'); return }
-    quotaPurchaseVisible.value = false; notify('额外账号额度申请已提交', 'success'); await loadCustomer()
+    if (!response.ok) { notify((await response.json()).detail || '创建额度订单失败', 'error'); return }
+    quotaPurchaseVisible.value = false; notify('账号额度订单已创建，等待支付', 'success'); await loadCustomer()
   } finally { purchaseSubmitting.value = false }
-}
-async function reviewPurchaseOrder(order: any, action: 'approve' | 'reject') {
-  let note = ''
-  if (action === 'reject') {
-    const result: any = await ElMessageBox.prompt('请输入拒绝原因', '拒绝购买申请', { inputType: 'textarea', inputValidator: value => !!value.trim() || '请输入拒绝原因' }).catch(() => null)
-    if (!result) return
-    note = result.value.trim()
-  } else {
-    const confirmed = await ElMessageBox.confirm('确认该申请已完成费用核对，并立即开通对应权益吗？', '通过购买申请', { type: 'warning' }).catch(() => false)
-    if (!confirmed) return
-  }
-  const response = await fetch(`/api/admin/purchase-orders/${order.id}/review`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ action, note }) })
-  if (!response.ok) { notify((await response.json()).detail || '处理申请失败', 'error'); return }
-  notify(action === 'approve' ? '权益已开通' : '申请已拒绝', 'success'); await load()
 }
 async function addCustomerAccount() {
   if (!newCustomerAccountName.value.trim()) { notify('请输入账号名称', 'warning'); return }
@@ -908,7 +885,6 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
           <el-menu-item index="server"><el-icon><Monitor /></el-icon><span>服务器监控</span></el-menu-item>
           <el-menu-item index="settings"><el-icon><Setting /></el-icon><span>平台配置</span></el-menu-item>
           <el-menu-item index="customers"><el-icon><UserFilled /></el-icon><span>客户管理</span></el-menu-item>
-          <el-menu-item index="orders"><el-icon><Tickets /></el-icon><span>购买申请</span></el-menu-item>
           <el-menu-item index="accounts"><el-icon><Avatar /></el-icon><span>抖音账号</span></el-menu-item>
           <el-menu-item index="scripts"><el-icon><ChatDotRound /></el-icon><span>话术审核</span></el-menu-item>
           <el-menu-item index="tasks"><el-icon><Operation /></el-icon><span>直播任务</span></el-menu-item>
@@ -944,31 +920,7 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
             <div class="settings-section"><div class="settings-title"><strong>话术管理</strong><span>套餐权益负责账号数量和任务额度，这里只设置平台级导入限制</span></div><div class="settings-grid"><el-form-item label="单次话术导入上限"><el-input-number v-model="platformSettings.script_bulk_import_limit" :min="1" :max="1000" /></el-form-item></div></div>
             <div class="settings-section"><div class="settings-title"><strong>评论间隔</strong><span>客户创建任务时只能在此范围内设置评论间隔</span></div><div class="settings-grid"><el-form-item label="允许的最小间隔（秒）"><el-input-number v-model="platformSettings.comment_min_interval_seconds" :min="5" :max="3600" /></el-form-item><el-form-item label="允许的最大间隔（秒）"><el-input-number v-model="platformSettings.comment_max_interval_seconds" :min="5" :max="3600" /></el-form-item></div></div>
             <div class="settings-section"><div class="settings-title"><strong>登录与 Worker</strong><span>控制二维码有效时间以及异常执行账号的判定和回收</span></div><div class="settings-grid"><el-form-item label="登录二维码有效时间（分钟）"><el-input-number v-model="platformSettings.qr_expire_minutes" :min="1" :max="30" /></el-form-item><el-form-item label="Worker 心跳超时（秒）"><el-input-number v-model="platformSettings.worker_heartbeat_timeout_seconds" :min="10" :max="300" /></el-form-item><el-form-item label="异常账号回收时间（秒）"><el-input-number v-model="platformSettings.account_reclaim_seconds" :min="30" :max="1800" /></el-form-item></div></div>
-            <div class="settings-section plan-settings-section"><div class="settings-title"><strong>套餐与收费</strong><span>套餐价格按30天周期设置，任务创建本身不产生单次费用</span></div><div class="admin-plan-list"><section v-for="plan in subscriptionPlans" :key="plan.id" class="admin-plan-card"><div class="mobile-card-title"><strong>{{ plan.name }}</strong><el-switch v-model="plan.enabled" active-text="上架" inactive-text="下架" /></div><div class="settings-grid"><el-form-item label="套餐价格（分/30天）"><el-input-number v-model="plan.price_cents" :min="0" :max="100000000" /></el-form-item><el-form-item label="额外账号单价（分/个）"><el-input-number v-model="plan.extra_account_price_cents" :min="0" :max="100000000" /></el-form-item><el-form-item label="自有账号基础额度"><el-input-number v-model="plan.base_douyin_account_quota" :min="0" :max="1000" /></el-form-item><el-form-item label="平台账号分配数量"><el-input-number v-model="plan.platform_account_count" :min="1" :max="100" /></el-form-item><el-form-item label="同时活动任务数"><el-input-number v-model="plan.max_active_tasks" :min="1" :max="20" /></el-form-item><el-form-item label="单任务话术上限"><el-input-number v-model="plan.max_scripts_per_task" :min="1" :max="500" /></el-form-item></div><el-button type="primary" :loading="planSavingId === plan.id" @click="saveSubscriptionPlan(plan)">保存{{ plan.name }}</el-button></section></div></div>
-          </el-card>
-        </template>
-
-        <template v-else-if="active === 'orders'">
-          <el-card shadow="never" style="margin-bottom: 12px">
-            <div class="query-title">查询条件</div>
-            <el-form inline label-position="right" class="queryForm">
-              <el-form-item label="订单"><el-input v-model="purchaseOrderKeyword" clearable placeholder="订单号 / 客户名称" :prefix-icon="Search" /></el-form-item>
-              <el-form-item label="状态"><el-select v-model="purchaseOrderStatus" clearable placeholder="请选择"><el-option label="处理中" value="pending" /><el-option label="已开通" value="approved" /><el-option label="已拒绝" value="rejected" /></el-select></el-form-item>
-              <el-form-item><el-button type="primary" @click="load">搜索</el-button><el-button @click="purchaseOrderKeyword = ''; purchaseOrderStatus = ''">重置</el-button></el-form-item>
-            </el-form>
-          </el-card>
-          <el-card shadow="never">
-            <div class="table-toolbar"><div class="table-title">购买申请列表</div><div class="record-total">共 {{ filteredPurchaseOrders.length }} 条记录</div></div>
-            <el-table v-loading="loading" :data="filteredPurchaseOrders" border stripe style="width:100%" empty-text="暂无购买申请">
-              <el-table-column type="index" label="序号" width="70" />
-              <el-table-column prop="order_no" label="订单号" min-width="190" />
-              <el-table-column label="客户" min-width="150"><template #default="{ row }">{{ customerName(row.customer_id) }}</template></el-table-column>
-              <el-table-column label="申请内容" min-width="190"><template #default="{ row }">{{ row.order_type === 'plan_upgrade' ? `升级至${planName(row.plan_id)}` : `增加 ${row.quota_quantity} 个账号额度` }}</template></el-table-column>
-              <el-table-column label="金额" width="130"><template #default="{ row }">{{ row.amount_cents == null ? '待确认' : `¥${(row.amount_cents / 100).toFixed(2)}` }}</template></el-table-column>
-              <el-table-column label="状态" width="110"><template #default="{ row }"><el-tag :type="row.status === 'approved' ? 'success' : row.status === 'rejected' ? 'danger' : 'warning'">{{ row.status === 'approved' ? '已开通' : row.status === 'rejected' ? '已拒绝' : '处理中' }}</el-tag></template></el-table-column>
-              <el-table-column label="提交时间" width="180"><template #default="{ row }">{{ formatDate(row.created_at) }}</template></el-table-column>
-              <el-table-column label="操作" width="150" fixed="right"><template #default="{ row }"><template v-if="row.status === 'pending'"><el-button link type="success" @click="reviewPurchaseOrder(row, 'approve')">通过</el-button><el-button link type="danger" @click="reviewPurchaseOrder(row, 'reject')">拒绝</el-button></template><span v-else class="cell-secondary">已处理</span></template></el-table-column>
-            </el-table>
+            <div class="settings-section plan-settings-section"><div class="settings-title"><strong>套餐与收费</strong><span>套餐价格按30天周期设置，任务创建本身不产生单次费用</span><el-form-item label="额外账号额度单价（分/个）" class="quota-price-setting"><el-input-number v-model="platformSettings.extra_account_quota_price_cents" :min="0" :max="100000000" /></el-form-item></div><div class="admin-plan-list"><section v-for="plan in subscriptionPlans" :key="plan.id" class="admin-plan-card"><div class="mobile-card-title"><strong>{{ plan.name }}</strong><el-switch v-model="plan.enabled" active-text="上架" inactive-text="下架" /></div><div class="settings-grid"><el-form-item label="套餐价格（分/30天）"><el-input-number v-model="plan.price_cents" :min="0" :max="100000000" /></el-form-item><el-form-item label="自有账号基础额度"><el-input-number v-model="plan.base_douyin_account_quota" :min="0" :max="1000" /></el-form-item><el-form-item label="平台账号分配数量"><el-input-number v-model="plan.platform_account_count" :min="1" :max="100" /></el-form-item><el-form-item label="同时活动任务数"><el-input-number v-model="plan.max_active_tasks" :min="1" :max="20" /></el-form-item><el-form-item label="单任务话术上限"><el-input-number v-model="plan.max_scripts_per_task" :min="1" :max="500" /></el-form-item></div><el-button type="primary" :loading="planSavingId === plan.id" @click="saveSubscriptionPlan(plan)">保存{{ plan.name }}</el-button></section></div></div>
           </el-card>
         </template>
 
@@ -1142,12 +1094,12 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
           <section v-for="plan in subscriptionPlans" :key="plan.id" class="mobile-card plan-card" :class="{ current: plan.id === currentPlan?.id }">
             <div class="mobile-card-title"><strong>{{ plan.name }}</strong><el-tag v-if="plan.id === currentPlan?.id" type="success">当前套餐</el-tag></div>
             <ul><li>自有抖音账号 {{ plan.base_douyin_account_quota }} 个</li><li>平台任务分配 {{ plan.platform_account_count }} 个账号</li><li>同时运行 {{ plan.max_active_tasks }} 个任务</li><li>单任务最多 {{ plan.max_scripts_per_task }} 条话术</li><li>套餐周期 {{ plan.duration_days }} 天</li></ul>
-            <div class="plan-price">{{ plan.price_cents == null ? '价格由平台确认' : `¥${(plan.price_cents / 100).toFixed(2)} / 期` }}</div>
-            <el-button v-if="plan.tier_level > (currentPlan?.tier_level || 0)" type="primary" plain :loading="purchaseSubmitting" @click="requestPlanUpgrade(plan)">申请升级</el-button>
+            <div class="plan-price">{{ plan.price_cents > 0 ? `¥${(plan.price_cents / 100).toFixed(2)} / 期` : '管理员暂未定价' }}</div>
+            <el-button v-if="plan.tier_level > (currentPlan?.tier_level || 0)" type="primary" plain :disabled="!plan.price_cents" :loading="purchaseSubmitting" @click="createPlanOrder(plan)">立即升级</el-button>
           </section>
         </div>
-        <section class="mobile-card quota-purchase-card"><div><strong>额外抖音账号额度</strong><span>当前额外额度 {{ customerAccountQuota.extra_quota }} 个，总额度 {{ customerAccountQuota.total_quota }} 个</span></div><el-button type="primary" @click="quotaPurchaseVisible = true">购买额度</el-button></section>
-        <section v-if="customerPurchaseOrders.length" class="mobile-card"><div class="mobile-card-title"><strong>我的购买申请</strong></div><div v-for="order in customerPurchaseOrders" :key="order.id" class="purchase-order-row"><span>{{ order.order_type === 'plan_upgrade' ? `升级至${planName(order.plan_id)}` : `增加 ${order.quota_quantity} 个账号额度` }}</span><el-tag :type="order.status === 'approved' ? 'success' : order.status === 'rejected' ? 'danger' : 'warning'">{{ order.status === 'approved' ? '已开通' : order.status === 'rejected' ? '已拒绝' : '处理中' }}</el-tag></div></section>
+        <section class="mobile-card quota-purchase-card"><div><strong>额外抖音账号额度</strong><span>当前额外额度 {{ customerAccountQuota.extra_quota }} 个，总额度 {{ customerAccountQuota.total_quota }} 个 · 单价 {{ platformSettings.extra_account_quota_price_cents > 0 ? `¥${(platformSettings.extra_account_quota_price_cents / 100).toFixed(2)}` : '暂未设置' }}</span></div><el-button type="primary" @click="quotaPurchaseVisible = true">购买额度</el-button></section>
+        <section v-if="customerPurchaseOrders.length" class="mobile-card"><div class="mobile-card-title"><strong>我的购买订单</strong></div><div v-for="order in customerPurchaseOrders" :key="order.id" class="purchase-order-row"><span>{{ order.order_type === 'plan_upgrade' ? `购买${planName(order.plan_id)}` : `购买 ${order.quota_quantity} 个账号额度` }}</span><span>¥{{ ((order.amount_cents || 0) / 100).toFixed(2) }}</span><el-tag :type="order.status === 'paid' ? 'success' : 'warning'">{{ order.status === 'paid' ? '已支付' : '待支付' }}</el-tag></div></section>
         <section class="mobile-card profile-list"><div><span>客户名称</span><b>{{ customerMe?.display_name }}</b></div><div><span>登录账号</span><b>{{ customerMe?.login }}</b></div><div><span>账户状态</span><el-tag type="success">正常</el-tag></div></section>
         <el-button class="mobile-full-button" @click="profileVisible = true">修改密码</el-button><el-button class="mobile-full-button" type="danger" plain @click="logout">退出登录</el-button>
       </template>
@@ -1203,8 +1155,8 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
     </el-dialog>
     <el-dialog v-model="quotaPurchaseVisible" title="购买额外账号额度" width="min(92vw, 420px)" align-center>
       <el-form label-position="top"><el-form-item label="购买数量"><el-input-number v-model="quotaPurchaseQuantity" :min="1" :max="100" /></el-form-item></el-form>
-      <el-alert title="提交后由管理员确认价格并开通额度" type="info" :closable="false" />
-      <template #footer><el-button @click="quotaPurchaseVisible = false">取消</el-button><el-button type="primary" :loading="purchaseSubmitting" @click="requestAccountQuota">提交购买申请</el-button></template>
+      <el-alert :title="platformSettings.extra_account_quota_price_cents > 0 ? `单价 ¥${(platformSettings.extra_account_quota_price_cents / 100).toFixed(2)}，合计 ¥${(platformSettings.extra_account_quota_price_cents * quotaPurchaseQuantity / 100).toFixed(2)}` : '管理员尚未设置账号额度价格'" :type="platformSettings.extra_account_quota_price_cents > 0 ? 'info' : 'warning'" :closable="false" />
+      <template #footer><el-button @click="quotaPurchaseVisible = false">取消</el-button><el-button type="primary" :disabled="platformSettings.extra_account_quota_price_cents <= 0" :loading="purchaseSubmitting" @click="requestAccountQuota">创建购买订单</el-button></template>
     </el-dialog>
     <el-dialog v-model="addCustomerAccountVisible" title="添加我的抖音号" width="min(92vw, 420px)" align-center><el-form label-position="top"><el-form-item label="账号备注名称"><el-input v-model="newCustomerAccountName" maxlength="100" placeholder="例如：直播账号 1" @keyup.enter="addCustomerAccount" /></el-form-item></el-form><template #footer><el-button @click="addCustomerAccountVisible = false">取消</el-button><el-button type="primary" :loading="addCustomerAccountLoading" @click="addCustomerAccount">添加</el-button></template></el-dialog>
     <el-dialog v-model="logVisible" title="评论日志" width="min(94vw, 760px)" align-center><el-table :data="customerLogs" border stripe max-height="460" empty-text="暂无评论日志"><el-table-column type="index" label="序号" width="70" /><el-table-column label="时间" width="170"><template #default="{ row }">{{ formatDate(row.sent_at || row.created_at) }}</template></el-table-column><el-table-column prop="content" label="评论内容" min-width="240" show-overflow-tooltip /><el-table-column prop="result" label="结果" width="120" /><el-table-column prop="sensitive_word" label="敏感词" width="120"><template #default="{ row }">{{ row.sensitive_word || '—' }}</template></el-table-column></el-table></el-dialog>

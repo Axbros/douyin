@@ -129,7 +129,6 @@ class SubscriptionPlan(TimestampMixin, Base):
     max_active_tasks: Mapped[int] = mapped_column(Integer, default=1)
     max_scripts_per_task: Mapped[int] = mapped_column(Integer, default=100)
     price_cents: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    extra_account_price_cents: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     features: Mapped[list | None] = mapped_column(JSON, nullable=True)
     enabled: Mapped[bool] = mapped_column(default=True)
 
@@ -142,10 +141,7 @@ class PurchaseOrder(TimestampMixin, Base):
     plan_id: Mapped[int | None] = mapped_column(ForeignKey("subscription_plans.id"), nullable=True)
     quota_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
     amount_cents: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    status: Mapped[str] = mapped_column(String(20), default="pending")
-    reviewed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
-    reviewed_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=3), nullable=True)
-    note: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending_payment")
 
 
 class TaskAccount(TimestampMixin, Base):

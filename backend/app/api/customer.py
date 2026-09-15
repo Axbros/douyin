@@ -77,10 +77,10 @@ async def list_purchase_orders(user: Annotated[User, Depends(customer_user)], db
 async def create_purchase_order(payload: PurchaseOrderCreate, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
     pending = await db.scalar(select(PurchaseOrder.id).where(
         PurchaseOrder.customer_id == user.id, PurchaseOrder.order_type == payload.order_type,
-        PurchaseOrder.status == "pending", PurchaseOrder.deleted_at.is_(None),
+        PurchaseOrder.status == "pending_payment", PurchaseOrder.deleted_at.is_(None),
     ))
     if pending:
-        raise HTTPException(409, "已有同类型申请正在处理中")
+        raise HTTPException(409, "已有同类型订单等待支付")
     current_plan = await get_customer_plan(db, user)
     plan = None
     amount_cents = None
@@ -92,16 +92,18 @@ async def create_purchase_order(payload: PurchaseOrderCreate, user: Annotated[Us
         if not plan:
             raise HTTPException(404, "套餐不存在或已下架")
         if plan.tier_level <= current_plan.tier_level:
-            raise HTTPException(409, "只能申请升级到更高等级的套餐")
+            raise HTTPException(409, "只能购买更高等级的套餐")
         amount_cents = plan.price_cents
     else:
-        if current_plan.extra_account_price_cents is not None:
-            amount_cents = current_plan.extra_account_price_cents * payload.quota_quantity
+        settings = await get_platform_settings(db)
+        amount_cents = settings["extra_account_quota_price_cents"] * payload.quota_quantity
+    if amount_cents is None or amount_cents <= 0:
+        raise HTTPException(409, "管理员尚未配置有效价格")
     order = PurchaseOrder(
         order_no=f"PO{datetime.now():%Y%m%d%H%M%S}{token_hex(3).upper()}",
         customer_id=user.id, order_type=payload.order_type,
         plan_id=plan.id if plan else None, quota_quantity=payload.quota_quantity,
-        amount_cents=amount_cents, status="pending",
+        amount_cents=amount_cents, status="pending_payment",
     )
     db.add(order)
     await db.commit()

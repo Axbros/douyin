@@ -11,6 +11,7 @@ DEFAULT_PLATFORM_SETTINGS = {
     "qr_expire_minutes": 5,
     "worker_heartbeat_timeout_seconds": 20,
     "account_reclaim_seconds": 60,
+    "extra_account_quota_price_cents": 0,
 }
 
 SETTING_KEYS = {name: f"platform.{name}" for name in DEFAULT_PLATFORM_SETTINGS}

@@ -290,6 +290,7 @@ class PlatformSettingsResponse(BaseModel):
     qr_expire_minutes: int
     worker_heartbeat_timeout_seconds: int
     account_reclaim_seconds: int
+    extra_account_quota_price_cents: int
 
 
 class PlatformSettingsUpdate(PlatformSettingsResponse):
@@ -299,6 +300,7 @@ class PlatformSettingsUpdate(PlatformSettingsResponse):
     qr_expire_minutes: int = Field(ge=1, le=30)
     worker_heartbeat_timeout_seconds: int = Field(ge=10, le=300)
     account_reclaim_seconds: int = Field(ge=30, le=1800)
+    extra_account_quota_price_cents: int = Field(ge=0, le=100000000)
 
     @model_validator(mode="after")
     def validate_ranges(self):
@@ -320,7 +322,6 @@ class SubscriptionPlanResponse(BaseModel):
     max_active_tasks: int
     max_scripts_per_task: int
     price_cents: int | None = None
-    extra_account_price_cents: int | None = None
     features: list | None = None
     enabled: bool
 
@@ -334,7 +335,6 @@ class SubscriptionPlanUpdate(BaseModel):
     max_active_tasks: int | None = Field(default=None, ge=1, le=20)
     max_scripts_per_task: int | None = Field(default=None, ge=1, le=500)
     price_cents: int | None = Field(default=None, ge=0, le=100000000)
-    extra_account_price_cents: int | None = Field(default=None, ge=0, le=100000000)
     enabled: bool | None = None
 
 
@@ -368,19 +368,6 @@ class PurchaseOrderResponse(BaseModel):
     quota_quantity: int | None = None
     amount_cents: int | None = None
     status: str
-    note: str | None = None
-    reviewed_at: datetime | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
-
-
-class PurchaseOrderReview(BaseModel):
-    action: str = Field(pattern="^(approve|reject)$")
-    note: str | None = Field(default=None, max_length=500)
-
-    @model_validator(mode="after")
-    def validate_rejection(self):
-        if self.action == "reject" and not (self.note or "").strip():
-            raise ValueError("拒绝申请时必须填写原因")
-        return self

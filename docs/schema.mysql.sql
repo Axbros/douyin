@@ -18,7 +18,6 @@ CREATE TABLE subscription_plans (
     max_active_tasks INT UNSIGNED NOT NULL DEFAULT 1,
     max_scripts_per_task INT UNSIGNED NOT NULL DEFAULT 100,
     price_cents BIGINT UNSIGNED NULL,
-    extra_account_price_cents BIGINT UNSIGNED NULL,
     features JSON NULL,
     enabled TINYINT(1) NOT NULL DEFAULT 1,
     created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
@@ -61,7 +60,7 @@ CREATE TABLE users (
     CONSTRAINT fk_users_subscription_plan FOREIGN KEY (subscription_plan_id) REFERENCES subscription_plans(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
--- 客户套餐升级和额外账号额度购买申请。支付渠道接入后可沿用此订单表。
+-- 客户套餐升级和额外账号额度购买订单。
 CREATE TABLE purchase_orders (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     order_no VARCHAR(40) NOT NULL,
@@ -70,10 +69,7 @@ CREATE TABLE purchase_orders (
     plan_id BIGINT UNSIGNED NULL,
     quota_quantity INT UNSIGNED NULL,
     amount_cents BIGINT UNSIGNED NULL,
-    status VARCHAR(20) NOT NULL DEFAULT 'pending' COMMENT 'pending/approved/rejected/cancelled',
-    reviewed_by BIGINT UNSIGNED NULL,
-    reviewed_at DATETIME(3) NULL,
-    note VARCHAR(500) NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending_payment' COMMENT 'pending_payment/paid/cancelled/refunded',
     created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
     deleted_at DATETIME(3) NULL,
@@ -83,8 +79,7 @@ CREATE TABLE purchase_orders (
     KEY idx_purchase_orders_status (status, created_at),
     KEY idx_purchase_orders_deleted_at (deleted_at),
     CONSTRAINT fk_purchase_orders_customer FOREIGN KEY (customer_id) REFERENCES users(id),
-    CONSTRAINT fk_purchase_orders_plan FOREIGN KEY (plan_id) REFERENCES subscription_plans(id),
-    CONSTRAINT fk_purchase_orders_reviewer FOREIGN KEY (reviewed_by) REFERENCES users(id)
+    CONSTRAINT fk_purchase_orders_plan FOREIGN KEY (plan_id) REFERENCES subscription_plans(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- 执行 Playwright 的 Worker 进程
@@ -333,4 +328,5 @@ VALUES
     ('platform.script_bulk_import_limit', JSON_OBJECT('value', 200)),
     ('platform.qr_expire_minutes', JSON_OBJECT('value', 5)),
     ('platform.worker_heartbeat_timeout_seconds', JSON_OBJECT('value', 20)),
-    ('platform.account_reclaim_seconds', JSON_OBJECT('value', 60));
+    ('platform.account_reclaim_seconds', JSON_OBJECT('value', 60)),
+    ('platform.extra_account_quota_price_cents', JSON_OBJECT('value', 0));

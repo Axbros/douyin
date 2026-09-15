@@ -22,7 +22,7 @@ from app.core.crypto import encrypt_transient_secret
 from app.core.platform_settings import get_platform_settings, update_platform_settings
 from app.core.security import hash_password
 from app.dependencies import admin_user
-from app.models import (AccountLoginSession, AccountLog, CommentLog, DouyinAccount, PurchaseOrder, Script,
+from app.models import (AccountLoginSession, AccountLog, CommentLog, DouyinAccount, Script,
                         SensitiveWord, SubscriptionPlan, Task, TaskAccount, User, Worker)
 from app.schemas import (
     AccountResponse,
@@ -41,8 +41,6 @@ from app.schemas import (
     LoginVerificationMethodRequest,
     PlatformSettingsResponse,
     PlatformSettingsUpdate,
-    PurchaseOrderResponse,
-    PurchaseOrderReview,
     ScriptResponse, ScriptBatchReviewRequest,
     ServerStatusResponse,
     ServiceStatus,
@@ -298,50 +296,6 @@ async def update_subscription_plan(plan_id: int, payload: SubscriptionPlanUpdate
     await db.commit()
     await db.refresh(plan)
     return plan
-
-
-@router.get("/purchase-orders", response_model=list[PurchaseOrderResponse])
-async def admin_purchase_orders(user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
-    return list(await db.scalars(select(PurchaseOrder).where(
-        PurchaseOrder.deleted_at.is_(None),
-    ).order_by(PurchaseOrder.id.desc()).limit(500)))
-
-
-@router.post("/purchase-orders/{order_id}/review", response_model=PurchaseOrderResponse)
-async def review_purchase_order(order_id: int, payload: PurchaseOrderReview, user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
-    order = await db.scalar(select(PurchaseOrder).where(
-        PurchaseOrder.id == order_id, PurchaseOrder.deleted_at.is_(None),
-    ).with_for_update())
-    if not order:
-        raise HTTPException(404, "购买申请不存在")
-    if order.status != "pending":
-        raise HTTPException(409, "该购买申请已经处理")
-    if payload.action == "approve":
-        customer = await db.scalar(select(User).where(User.id == order.customer_id).with_for_update())
-        if not customer or customer.role != "customer" or customer.deleted_at is not None:
-            raise HTTPException(409, "客户不存在或已删除")
-        if order.order_type == "plan_upgrade":
-            plan = await db.scalar(select(SubscriptionPlan).where(
-                SubscriptionPlan.id == order.plan_id, SubscriptionPlan.enabled.is_(True),
-                SubscriptionPlan.deleted_at.is_(None),
-            ))
-            if not plan:
-                raise HTTPException(409, "目标套餐不存在或已下架")
-            customer.subscription_plan_id = plan.id
-            base = customer.expires_at if customer.expires_at and customer.expires_at > datetime.now() else datetime.now()
-            customer.expires_at = base + timedelta(days=plan.duration_days)
-            customer.status = "active"
-        elif order.order_type == "account_quota":
-            customer.extra_douyin_account_quota += order.quota_quantity or 0
-        order.status = "approved"
-    else:
-        order.status = "rejected"
-    order.reviewed_by = user.id
-    order.reviewed_at = datetime.now()
-    order.note = (payload.note or "").strip() or None
-    await db.commit()
-    await db.refresh(order)
-    return order
 
 
 @router.get("/tasks", response_model=list[TaskResponse])
