@@ -94,7 +94,7 @@ async def run_account(task_id: int, assignment_id: int, account_id: int, room_id
             ).where(
                 TaskScript.task_id == task_id, Script.status == "approved",
                 Script.deleted_at.is_(None), TaskScript.deleted_at.is_(None),
-            )))
+            ).order_by(TaskScript.sort_order.asc(), TaskScript.id.asc())))
             sensitive_words = list(await db.scalars(select(SensitiveWord).where(
                 SensitiveWord.enabled.is_(True), SensitiveWord.deleted_at.is_(None)
             )))
@@ -133,7 +133,11 @@ async def run_account(task_id: int, assignment_id: int, account_id: int, room_id
                     break
                 if task.status == "paused":
                     continue
-            script = random.choices(scripts, weights=[max(1, s.weight) for s in scripts], k=1)[0]
+            if task.script_order_mode == "sequential":
+                sequence = await redis_client.incr(f"douyin:task:script-sequence:{task_id}")
+                script = scripts[(sequence - 1) % len(scripts)]
+            else:
+                script = random.choices(scripts, weights=[max(1, s.weight) for s in scripts], k=1)[0]
             matched_word = find_sensitive_word(script.content, sensitive_words)
             if matched_word:
                 async with SessionLocal() as db:

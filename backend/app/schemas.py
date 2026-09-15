@@ -124,6 +124,7 @@ class TaskCreate(BaseModel):
     max_interval_seconds: int = Field(default=50, ge=5, le=3600)
     account_source: str = Field(default="platform", pattern="^(platform|customer)$")
     account_ids: list[int] = Field(default_factory=list, max_length=100)
+    script_order_mode: str = Field(default="random", pattern="^(random|sequential)$")
 
 
 class TaskResponse(BaseModel):
@@ -134,6 +135,7 @@ class TaskResponse(BaseModel):
     target_account_count: int
     account_source: str
     billing_amount_cents: int
+    script_order_mode: str
     min_interval_seconds: int
     max_interval_seconds: int
     started_at: datetime | None = None

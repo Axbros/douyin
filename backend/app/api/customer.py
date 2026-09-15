@@ -262,6 +262,8 @@ async def create_task(payload: TaskCreate, user: Annotated[User, Depends(custome
     )))
     if len(scripts) != len(set(payload.script_ids)):
         raise HTTPException(409, "只能使用审核通过且属于自己的话术")
+    scripts_by_id = {script.id: script for script in scripts}
+    ordered_scripts = [scripts_by_id[script_id] for script_id in payload.script_ids]
     # 按任务模式锁定对应账号，避免并发任务抢占同一个浏览器身份。
     if payload.account_source == "customer":
         account_ids = list(dict.fromkeys(payload.account_ids))
@@ -291,16 +293,21 @@ async def create_task(payload: TaskCreate, user: Annotated[User, Depends(custome
         billing_amount_cents = platform_settings["platform_account_task_price_cents"]
     task = Task(customer_id=user.id, room_id=payload.room_id, target_account_count=target_account_count,
                 account_source=payload.account_source, billing_amount_cents=billing_amount_cents,
+                script_order_mode=payload.script_order_mode,
                 min_interval_seconds=payload.min_interval_seconds, max_interval_seconds=payload.max_interval_seconds)
     db.add(task)
     await db.flush()
-    db.add_all([TaskScript(task_id=task.id, script_id=script.id) for script in scripts])
+    db.add_all([
+        TaskScript(task_id=task.id, script_id=script.id, sort_order=index)
+        for index, script in enumerate(ordered_scripts)
+    ])
     for account in accounts:
         account.current_task_id = task.id
         account.status = "busy"
         db.add(TaskAccount(task_id=task.id, account_id=account.id, status="assigned", assigned_by=user.id))
     await db.commit()
     await db.refresh(task)
+    await redis_client.delete(f"douyin:task:script-sequence:{task.id}")
     await redis_client.rpush("douyin:tasks", str(task.id))
     return task
 

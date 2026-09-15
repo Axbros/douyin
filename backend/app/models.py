@@ -101,6 +101,7 @@ class Task(TimestampMixin, Base):
     target_account_count: Mapped[int] = mapped_column(Integer, default=3)
     account_source: Mapped[str] = mapped_column(String(20), default="platform")
     billing_amount_cents: Mapped[int] = mapped_column(Integer, default=0)
+    script_order_mode: Mapped[str] = mapped_column(String(20), default="random")
     min_interval_seconds: Mapped[int] = mapped_column(Integer, default=20)
     max_interval_seconds: Mapped[int] = mapped_column(Integer, default=50)
     started_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=3), nullable=True)
@@ -113,6 +114,7 @@ class TaskScript(TimestampMixin, Base):
     __tablename__ = "task_scripts"
     task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"))
     script_id: Mapped[int] = mapped_column(ForeignKey("scripts.id"))
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
     __table_args__ = (UniqueConstraint("task_id", "script_id", name="uk_task_scripts_pair"),)
 
 
