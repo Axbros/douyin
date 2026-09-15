@@ -25,6 +25,7 @@ class User(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(20), default="active")
     last_login_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=3), nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=3), nullable=True)
+    extra_douyin_account_quota: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class Script(TimestampMixin, Base):
@@ -56,6 +57,8 @@ class DouyinAccount(TimestampMixin, Base):
     display_name: Mapped[str] = mapped_column(String(100))
     account_uid: Mapped[str | None] = mapped_column(String(100), unique=True, nullable=True)
     assigned_customer_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    ownership_type: Mapped[str] = mapped_column(String(20), default="platform")
+    owner_customer_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="unlogged")
     enabled: Mapped[bool] = mapped_column(default=True)
     encrypted_storage_state: Mapped[bytes | None] = mapped_column(MEDIUMBLOB, nullable=True)
@@ -96,6 +99,8 @@ class Task(TimestampMixin, Base):
     room_id: Mapped[str] = mapped_column(String(100))
     status: Mapped[str] = mapped_column(String(20), default="pending")
     target_account_count: Mapped[int] = mapped_column(Integer, default=3)
+    account_source: Mapped[str] = mapped_column(String(20), default="platform")
+    billing_amount_cents: Mapped[int] = mapped_column(Integer, default=0)
     min_interval_seconds: Mapped[int] = mapped_column(Integer, default=20)
     max_interval_seconds: Mapped[int] = mapped_column(Integer, default=50)
     started_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=3), nullable=True)

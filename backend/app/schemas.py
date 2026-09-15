@@ -20,6 +20,7 @@ class UserResponse(BaseModel):
     display_name: str
     status: str
     expires_at: datetime | None = None
+    extra_douyin_account_quota: int = 0
 
     model_config = {"from_attributes": True}
 
@@ -33,6 +34,7 @@ class AdminCustomerCreate(BaseModel):
 class AdminCustomerUpdate(BaseModel):
     login: str | None = Field(default=None, min_length=3, max_length=190)
     display_name: str | None = Field(default=None, min_length=1, max_length=100)
+    extra_douyin_account_quota: int | None = Field(default=None, ge=0, le=1000)
 
 
 class AdminCustomerStatusUpdate(BaseModel):
@@ -50,6 +52,7 @@ class AdminCustomerResponse(BaseModel):
     status: str
     last_login_at: datetime | None = None
     expires_at: datetime | None = None
+    extra_douyin_account_quota: int = 0
     created_at: datetime
     updated_at: datetime
 
@@ -99,6 +102,8 @@ class TaskCreate(BaseModel):
     script_ids: list[int] = Field(min_length=1)
     min_interval_seconds: int = Field(default=20, ge=5, le=3600)
     max_interval_seconds: int = Field(default=50, ge=5, le=3600)
+    account_source: str = Field(default="platform", pattern="^(platform|customer)$")
+    account_ids: list[int] = Field(default_factory=list, max_length=100)
 
 
 class TaskResponse(BaseModel):
@@ -107,6 +112,8 @@ class TaskResponse(BaseModel):
     room_id: str
     status: str
     target_account_count: int
+    account_source: str
+    billing_amount_cents: int
     min_interval_seconds: int
     max_interval_seconds: int
     started_at: datetime | None = None
@@ -167,6 +174,8 @@ class AccountResponse(BaseModel):
     id: int
     display_name: str
     account_uid: str | None = None
+    ownership_type: str = "platform"
+    owner_customer_id: int | None = None
     status: str
     enabled: bool
     last_login_at: datetime | None = None
@@ -261,6 +270,9 @@ class PlatformSettingsResponse(BaseModel):
     qr_expire_minutes: int
     worker_heartbeat_timeout_seconds: int
     account_reclaim_seconds: int
+    default_customer_account_quota: int
+    customer_account_task_price_cents: int
+    platform_account_task_price_cents: int
 
 
 class PlatformSettingsUpdate(PlatformSettingsResponse):
@@ -273,6 +285,9 @@ class PlatformSettingsUpdate(PlatformSettingsResponse):
     qr_expire_minutes: int = Field(ge=1, le=30)
     worker_heartbeat_timeout_seconds: int = Field(ge=10, le=300)
     account_reclaim_seconds: int = Field(ge=30, le=1800)
+    default_customer_account_quota: int = Field(ge=0, le=100)
+    customer_account_task_price_cents: int = Field(ge=0, le=100000000)
+    platform_account_task_price_cents: int = Field(ge=0, le=100000000)
 
     @model_validator(mode="after")
     def validate_ranges(self):
@@ -280,4 +295,6 @@ class PlatformSettingsUpdate(PlatformSettingsResponse):
             raise ValueError("评论最大间隔不能小于最小间隔")
         if self.account_reclaim_seconds < self.worker_heartbeat_timeout_seconds:
             raise ValueError("账号回收时间不能小于 Worker 心跳超时")
+        if self.platform_account_task_price_cents <= self.customer_account_task_price_cents:
+            raise ValueError("平台账号模式价格必须高于自有账号模式价格")
         return self

@@ -206,6 +206,8 @@ async def update_customer(customer_id: int, payload: AdminCustomerUpdate, user: 
         if not display_name:
             raise HTTPException(422, "客户名称不能为空")
         customer.display_name = display_name
+    if payload.extra_douyin_account_quota is not None:
+        customer.extra_douyin_account_quota = payload.extra_douyin_account_quota
     await db.commit()
     await db.refresh(customer)
     return customer
@@ -300,6 +302,10 @@ async def add_task_account(task_id: int, account_id: int, user: Annotated[User, 
     ).with_for_update())
     if not account:
         raise HTTPException(409, "抖音账号不可用或正在执行其他任务")
+    if task.account_source == "platform" and account.ownership_type != "platform":
+        raise HTTPException(409, "平台账号模式只能添加平台账号")
+    if task.account_source == "customer" and (account.ownership_type != "customer" or account.owner_customer_id != task.customer_id):
+        raise HTTPException(409, "客户自有账号模式只能添加该客户自己的账号")
     assignment = await db.scalar(select(TaskAccount).where(
         TaskAccount.task_id == task_id, TaskAccount.account_id == account_id,
         TaskAccount.deleted_at.is_(None),
@@ -501,7 +507,7 @@ async def list_accounts(user: Annotated[User, Depends(admin_user)], db: Annotate
 
 @router.post("/douyin-accounts", response_model=AccountResponse, status_code=201)
 async def create_account(display_name: str, user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
-    account = DouyinAccount(display_name=display_name.strip() or "未命名账号", status="unlogged", enabled=True)
+    account = DouyinAccount(display_name=display_name.strip() or "未命名账号", ownership_type="platform", status="unlogged", enabled=True)
     db.add(account)
     await db.flush()
     db.add(AccountLog(account_id=account.id, event_type="account_created", detail={"admin_id": user.id}))
@@ -585,6 +591,10 @@ async def open_account_browser(account_id: int, user: Annotated[User, Depends(ad
         pipe.delete(f"douyin:account-browser:close:{account.id}")
         pipe.rpush("douyin:account-browser:open", str(account.id))
         await pipe.execute()
+    # 指令成功入队后立即反映到列表，Worker 失败时会再改为 error/unlogged。
+    account.status = "browser_open"
+    account.last_error = None
+    await db.commit()
     return {"message": "浏览器启动指令已发送", "account_id": account.id}
 
 
@@ -596,6 +606,12 @@ async def close_account_browser(account_id: int, user: Annotated[User, Depends(a
     if not account:
         raise HTTPException(404, "抖音账号不存在")
     await redis_client.rpush(f"douyin:account-browser:close:{account.id}", "close")
+    if account.current_task_id is None:
+        if not account.enabled:
+            account.status = "disabled"
+        else:
+            account.status = "available" if account.encrypted_storage_state else "unlogged"
+        await db.commit()
     return {"message": "浏览器关闭指令已发送", "account_id": account.id}
 
 

@@ -8,15 +8,143 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db, redis_client
 from app.core.platform_settings import get_platform_settings
 from app.dependencies import customer_user
-from app.models import CommentLog, DouyinAccount, Script, Task, TaskAccount, TaskScript, User
-from app.schemas import CommentLogResponse, PlatformSettingsResponse, ScriptBulkCreate, ScriptCreate, ScriptResponse, TaskAccountResponse, TaskCreate, TaskResponse
+from app.models import AccountLog, AccountLoginSession, CommentLog, DouyinAccount, Script, Task, TaskAccount, TaskScript, User
+from app.schemas import (AccountResponse, CommentLogResponse, DouyinAccountUpdate, LoginPasswordRequest,
+                         LoginSessionResponse, LoginVerificationCodeRequest, LoginVerificationMethodRequest,
+                         PlatformSettingsResponse, ScriptBulkCreate, ScriptCreate, ScriptResponse,
+                         TaskAccountResponse, TaskCreate, TaskResponse)
 
 router = APIRouter(prefix="/api/customer", tags=["customer"])
+
+
+async def _get_owned_account(account_id: int, user: User, db: AsyncSession) -> DouyinAccount:
+    account = await db.scalar(select(DouyinAccount).where(
+        DouyinAccount.id == account_id, DouyinAccount.ownership_type == "customer",
+        DouyinAccount.owner_customer_id == user.id, DouyinAccount.deleted_at.is_(None),
+    ))
+    if not account:
+        raise HTTPException(404, "自有抖音账号不存在")
+    return account
+
+
+async def _get_owned_session(session_id: int, user: User, db: AsyncSession) -> AccountLoginSession:
+    session = await db.scalar(select(AccountLoginSession).join(
+        DouyinAccount, DouyinAccount.id == AccountLoginSession.account_id
+    ).where(
+        AccountLoginSession.id == session_id, AccountLoginSession.deleted_at.is_(None),
+        DouyinAccount.ownership_type == "customer", DouyinAccount.owner_customer_id == user.id,
+        DouyinAccount.deleted_at.is_(None),
+    ))
+    if not session:
+        raise HTTPException(404, "登录会话不存在")
+    return session
 
 
 @router.get("/platform-settings", response_model=PlatformSettingsResponse)
 async def customer_platform_settings(user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
     return await get_platform_settings(db)
+
+
+@router.get("/douyin-accounts", response_model=list[AccountResponse])
+async def list_owned_accounts(user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    return list(await db.scalars(select(DouyinAccount).where(
+        DouyinAccount.ownership_type == "customer", DouyinAccount.owner_customer_id == user.id,
+        DouyinAccount.deleted_at.is_(None),
+    ).order_by(DouyinAccount.id.desc())))
+
+
+@router.get("/douyin-account-quota")
+async def owned_account_quota(user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    settings = await get_platform_settings(db)
+    used = await db.scalar(select(func.count(DouyinAccount.id)).where(
+        DouyinAccount.ownership_type == "customer", DouyinAccount.owner_customer_id == user.id,
+        DouyinAccount.deleted_at.is_(None),
+    ))
+    base = settings["default_customer_account_quota"]
+    return {"base_quota": base, "extra_quota": user.extra_douyin_account_quota,
+            "total_quota": base + user.extra_douyin_account_quota, "used": used}
+
+
+@router.post("/douyin-accounts", response_model=AccountResponse, status_code=201)
+async def create_owned_account(display_name: str, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    locked_user = await db.scalar(select(User).where(User.id == user.id).with_for_update())
+    settings = await get_platform_settings(db)
+    used = await db.scalar(select(func.count(DouyinAccount.id)).where(
+        DouyinAccount.ownership_type == "customer", DouyinAccount.owner_customer_id == user.id,
+        DouyinAccount.deleted_at.is_(None),
+    ))
+    quota = settings["default_customer_account_quota"] + locked_user.extra_douyin_account_quota
+    if used >= quota:
+        raise HTTPException(409, f"自有抖音账号额度已用完（{used}/{quota}），请购买额外额度")
+    account = DouyinAccount(display_name=display_name.strip() or "我的抖音账号", ownership_type="customer",
+                            owner_customer_id=user.id, status="unlogged", enabled=True)
+    db.add(account); await db.flush()
+    db.add(AccountLog(account_id=account.id, event_type="account_created", detail={"customer_id": user.id, "ownership_type": "customer"}))
+    await db.commit(); await db.refresh(account)
+    return account
+
+
+@router.patch("/douyin-accounts/{account_id}", response_model=AccountResponse)
+async def update_owned_account(account_id: int, payload: DouyinAccountUpdate, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    account = await _get_owned_account(account_id, user, db)
+    account.display_name = payload.display_name.strip()
+    if not account.display_name:
+        raise HTTPException(422, "账号名称不能为空")
+    db.add(AccountLog(account_id=account.id, event_type="account_updated", detail={"customer_id": user.id}))
+    await db.commit(); await db.refresh(account)
+    return account
+
+
+@router.delete("/douyin-accounts/{account_id}", status_code=204)
+async def delete_owned_account(account_id: int, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    account = await _get_owned_account(account_id, user, db)
+    if account.current_task_id is not None:
+        raise HTTPException(409, "账号正在执行任务，暂时不能删除")
+    account.deleted_at = datetime.now(); account.enabled = False; account.status = "disabled"
+    db.add(AccountLog(account_id=account.id, event_type="account_deleted", detail={"customer_id": user.id}))
+    await db.commit(); await redis_client.rpush(f"douyin:account-browser:close:{account.id}", "close")
+
+
+@router.post("/douyin-accounts/{account_id}/login-session", response_model=LoginSessionResponse, status_code=201)
+async def create_owned_login_session(account_id: int, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    await _get_owned_account(account_id, user, db)
+    from app.api.admin import create_login_session
+    return await create_login_session(account_id, user, db)
+
+
+@router.get("/douyin-login-sessions/{session_id}", response_model=LoginSessionResponse)
+async def owned_login_session_status(session_id: int, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    await _get_owned_session(session_id, user, db)
+    from app.api.admin import login_session_status
+    return await login_session_status(session_id, user, db)
+
+
+@router.post("/douyin-login-sessions/{session_id}/verification-method", status_code=202)
+async def owned_verification_method(session_id: int, payload: LoginVerificationMethodRequest, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    await _get_owned_session(session_id, user, db)
+    from app.api.admin import select_login_verification_method
+    return await select_login_verification_method(session_id, payload, user, db)
+
+
+@router.post("/douyin-login-sessions/{session_id}/verification-code", status_code=202)
+async def owned_verification_code(session_id: int, payload: LoginVerificationCodeRequest, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    await _get_owned_session(session_id, user, db)
+    from app.api.admin import submit_login_verification_code
+    return await submit_login_verification_code(session_id, payload, user, db)
+
+
+@router.post("/douyin-login-sessions/{session_id}/login-password", status_code=202)
+async def owned_login_password(session_id: int, payload: LoginPasswordRequest, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    await _get_owned_session(session_id, user, db)
+    from app.api.admin import submit_login_password
+    return await submit_login_password(session_id, payload, user, db)
+
+
+@router.post("/douyin-login-sessions/{session_id}/close", response_model=LoginSessionResponse)
+async def close_owned_login_session(session_id: int, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    await _get_owned_session(session_id, user, db)
+    from app.api.admin import close_login_session
+    return await close_login_session(session_id, user, db)
 
 
 @router.get("/scripts", response_model=list[ScriptResponse])
@@ -98,15 +226,35 @@ async def create_task(payload: TaskCreate, user: Annotated[User, Depends(custome
     )))
     if len(scripts) != len(set(payload.script_ids)):
         raise HTTPException(409, "只能使用审核通过且属于自己的话术")
-    # 锁定可用账号，避免不同客户并发创建任务时抢到同一个账号。
-    target_account_count = platform_settings["default_target_account_count"]
-    accounts = list(await db.scalars(select(DouyinAccount).where(
-        DouyinAccount.enabled.is_(True), DouyinAccount.status == "available",
-        DouyinAccount.current_task_id.is_(None), DouyinAccount.deleted_at.is_(None),
-    ).order_by(func.rand()).limit(target_account_count).with_for_update()))
-    if len(accounts) < target_account_count:
-        raise HTTPException(409, f"可用抖音账号不足，需要 {target_account_count} 个，当前只有 {len(accounts)} 个")
+    # 按任务模式锁定对应账号，避免并发任务抢占同一个浏览器身份。
+    if payload.account_source == "customer":
+        account_ids = list(dict.fromkeys(payload.account_ids))
+        if not account_ids:
+            raise HTTPException(422, "使用自有账号时至少选择一个账号")
+        accounts = list(await db.scalars(select(DouyinAccount).where(
+            DouyinAccount.id.in_(account_ids), DouyinAccount.ownership_type == "customer",
+            DouyinAccount.owner_customer_id == user.id, DouyinAccount.enabled.is_(True),
+            DouyinAccount.status == "available", DouyinAccount.current_task_id.is_(None),
+            DouyinAccount.deleted_at.is_(None),
+        ).with_for_update()))
+        if len(accounts) != len(account_ids):
+            raise HTTPException(409, "所选自有账号中存在未登录、不可用、忙碌或不属于您的账号")
+        target_account_count = len(accounts)
+        billing_amount_cents = platform_settings["customer_account_task_price_cents"]
+    else:
+        if payload.account_ids:
+            raise HTTPException(422, "平台账号模式不需要选择账号")
+        target_account_count = platform_settings["default_target_account_count"]
+        accounts = list(await db.scalars(select(DouyinAccount).where(
+            DouyinAccount.ownership_type == "platform", DouyinAccount.enabled.is_(True),
+            DouyinAccount.status == "available", DouyinAccount.current_task_id.is_(None),
+            DouyinAccount.deleted_at.is_(None),
+        ).order_by(func.rand()).limit(target_account_count).with_for_update()))
+        if len(accounts) < target_account_count:
+            raise HTTPException(409, f"平台可用抖音账号不足，需要 {target_account_count} 个，当前只有 {len(accounts)} 个")
+        billing_amount_cents = platform_settings["platform_account_task_price_cents"]
     task = Task(customer_id=user.id, room_id=payload.room_id, target_account_count=target_account_count,
+                account_source=payload.account_source, billing_amount_cents=billing_amount_cents,
                 min_interval_seconds=payload.min_interval_seconds, max_interval_seconds=payload.max_interval_seconds)
     db.add(task)
     await db.flush()

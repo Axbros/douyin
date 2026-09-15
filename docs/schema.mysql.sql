@@ -16,6 +16,7 @@ CREATE TABLE users (
     status VARCHAR(20) NOT NULL DEFAULT 'active' COMMENT 'active/disabled',
     last_login_at DATETIME(3) NULL,
     expires_at DATETIME(3) NULL COMMENT '客户服务到期时间，管理员为空',
+    extra_douyin_account_quota INT NOT NULL DEFAULT 0 COMMENT '客户额外自有抖音账号额度',
     created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
     deleted_at DATETIME(3) NULL,
@@ -45,12 +46,14 @@ CREATE TABLE workers (
     KEY idx_workers_deleted_at (deleted_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
--- 平台分配给客户的抖音账号。storage_state 必须由应用层加密后写入。
+-- 平台账号与客户自有账号。storage_state 必须由应用层加密后写入。
 CREATE TABLE douyin_accounts (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     display_name VARCHAR(100) NOT NULL,
     account_uid VARCHAR(100) NULL,
     assigned_customer_id BIGINT UNSIGNED NULL,
+    ownership_type VARCHAR(20) NOT NULL DEFAULT 'platform' COMMENT 'platform/customer',
+    owner_customer_id BIGINT UNSIGNED NULL,
     status VARCHAR(30) NOT NULL DEFAULT 'unlogged' COMMENT 'unlogged/available/assigned/running/risk_controlled/error/disabled',
     enabled TINYINT(1) NOT NULL DEFAULT 1,
     encrypted_storage_state MEDIUMBLOB NULL,
@@ -69,9 +72,11 @@ CREATE TABLE douyin_accounts (
     UNIQUE KEY uk_douyin_account_uid (account_uid),
     KEY idx_douyin_accounts_available (enabled, status, last_heartbeat_at),
     KEY idx_douyin_accounts_customer (assigned_customer_id),
+    KEY idx_douyin_accounts_owner (owner_customer_id, ownership_type, deleted_at),
     KEY idx_douyin_accounts_worker (current_worker_id),
     KEY idx_douyin_accounts_deleted_at (deleted_at),
     CONSTRAINT fk_douyin_account_customer FOREIGN KEY (assigned_customer_id) REFERENCES users(id),
+    CONSTRAINT fk_douyin_accounts_owner FOREIGN KEY (owner_customer_id) REFERENCES users(id),
     CONSTRAINT fk_douyin_account_worker FOREIGN KEY (current_worker_id) REFERENCES workers(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
@@ -127,6 +132,8 @@ CREATE TABLE tasks (
     room_id VARCHAR(100) NOT NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'pending' COMMENT 'pending/running/paused/stopped/failed',
     target_account_count INT UNSIGNED NOT NULL DEFAULT 3,
+    account_source VARCHAR(20) NOT NULL DEFAULT 'platform' COMMENT 'platform/customer',
+    billing_amount_cents INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '创建任务时的计价快照（分）',
     min_interval_seconds INT UNSIGNED NOT NULL DEFAULT 20,
     max_interval_seconds INT UNSIGNED NOT NULL DEFAULT 50,
     started_at DATETIME(3) NULL,
@@ -139,6 +146,7 @@ CREATE TABLE tasks (
     PRIMARY KEY (id),
     KEY idx_tasks_customer_status (customer_id, status, created_at),
     KEY idx_tasks_room_status (room_id, status),
+    KEY idx_tasks_account_source (account_source),
     KEY idx_tasks_deleted_at (deleted_at),
     CONSTRAINT fk_tasks_customer FOREIGN KEY (customer_id) REFERENCES users(id),
     CONSTRAINT chk_tasks_intervals CHECK (max_interval_seconds >= min_interval_seconds)
@@ -259,6 +267,9 @@ CREATE TABLE system_settings (
 INSERT INTO system_settings (setting_key, setting_value)
 VALUES
     ('task.default_target_account_count', JSON_OBJECT('value', 3)),
+    ('platform.default_customer_account_quota', JSON_OBJECT('value', 3)),
+    ('platform.customer_account_task_price_cents', JSON_OBJECT('value', 1000)),
+    ('platform.platform_account_task_price_cents', JSON_OBJECT('value', 3000)),
     ('platform.max_active_tasks_per_customer', JSON_OBJECT('value', 1)),
     ('platform.comment_min_interval_seconds', JSON_OBJECT('value', 5)),
     ('platform.comment_max_interval_seconds', JSON_OBJECT('value', 3600)),
