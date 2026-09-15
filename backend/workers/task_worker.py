@@ -7,7 +7,7 @@ import sys
 from datetime import datetime
 
 from playwright.async_api import async_playwright
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.core.crypto import decrypt_storage_state
@@ -60,12 +60,80 @@ def find_sensitive_word(content: str, words):
 from src.platforms import create_platform
 
 
+async def assign_replacement_account(task_id: int, failed_account_id: int) -> int | None:
+    """为仍在执行的任务补充一个同来源账号；没有可用账号时保持现状。"""
+    async with SessionLocal() as db:
+        task = await db.scalar(select(Task).where(
+            Task.id == task_id,
+            Task.status.in_(("running", "paused")),
+            Task.deleted_at.is_(None),
+        ).with_for_update())
+        if not task:
+            return None
+
+        conditions = [
+            DouyinAccount.id != failed_account_id,
+            DouyinAccount.enabled.is_(True),
+            DouyinAccount.status == "available",
+            DouyinAccount.current_task_id.is_(None),
+            DouyinAccount.encrypted_storage_state.is_not(None),
+            DouyinAccount.deleted_at.is_(None),
+        ]
+        if task.account_source == "customer":
+            conditions.extend((
+                DouyinAccount.ownership_type == "customer",
+                DouyinAccount.owner_customer_id == task.customer_id,
+            ))
+        else:
+            conditions.append(DouyinAccount.ownership_type == "platform")
+        replacement = await db.scalar(select(DouyinAccount).where(
+            *conditions,
+        ).order_by(func.rand()).limit(1).with_for_update())
+        if not replacement:
+            print(f"[TaskWorker] 任务 {task_id} 暂无可用替补账号", flush=True)
+            return None
+
+        assignment = await db.scalar(select(TaskAccount).where(
+            TaskAccount.task_id == task_id,
+            TaskAccount.account_id == replacement.id,
+        ).with_for_update())
+        if assignment:
+            assignment.status = "assigned"
+            assignment.assigned_by = None
+            assignment.assigned_at = datetime.now()
+            assignment.removed_at = None
+            assignment.last_error = None
+            assignment.deleted_at = None
+        else:
+            assignment = TaskAccount(task_id=task_id, account_id=replacement.id, status="assigned")
+            db.add(assignment)
+        replacement.status = "busy"
+        replacement.current_task_id = task_id
+        replacement.last_error = None
+        db.add(AccountLog(
+            account_id=replacement.id,
+            event_type="replacement_assigned",
+            detail={"task_id": task_id, "replaced_account_id": failed_account_id},
+        ))
+        await db.commit()
+        await db.refresh(assignment)
+
+    await redis_client.delete(f"douyin:task-account:stop:{assignment.id}")
+    await redis_client.rpush("douyin:task-accounts", str(assignment.id))
+    print(
+        f"[TaskWorker] 任务 {task_id} 已使用账号 {replacement.id} 替补异常账号 {failed_account_id}",
+        flush=True,
+    )
+    return replacement.id
+
+
 async def run_account(task_id: int, assignment_id: int, account_id: int, live_url: str, worker_id: int):
     platform = create_platform("douyin")
     playwright = browser = context = None
     failed = False
     login_expired = False
     claimed = False
+    needs_replacement = False
     try:
         async with SessionLocal() as db:
             account = await db.get(DouyinAccount, account_id)
@@ -157,10 +225,30 @@ async def run_account(task_id: int, assignment_id: int, account_id: int, live_ur
                     failure_reason=None if ok else "页面操作未确认评论发送成功",
                     sent_at=datetime.now(),
                 ))
+                if not ok:
+                    failed = True
+                    needs_replacement = True
+                    failure_reason = "页面操作未确认评论发送成功"
+                    assignment = await db.get(TaskAccount, assignment_id)
+                    if assignment:
+                        assignment.status = "error"
+                        assignment.last_error = failure_reason
+                    account_row = await db.get(DouyinAccount, account_id)
+                    if account_row:
+                        account_row.status = "error"
+                        account_row.last_error = failure_reason
+                    db.add(AccountLog(
+                        account_id=account_id,
+                        event_type="comment_failed",
+                        detail={"task_id": task_id, "live_url": live_url, "content": script.content, "reason": failure_reason},
+                    ))
                 await db.commit()
             print(f"[TaskWorker] 账号 {account_id} 评论{'成功' if ok else '失败'}: {script.content}", flush=True)
+            if not ok:
+                break
     except Exception as exc:
         failed = True
+        needs_replacement = True
         login_expired = isinstance(exc, LoginStateExpired)
         print(f"[TaskWorker] 账号 {account_id} 执行异常: {type(exc).__name__}: {exc}", flush=True)
         async with SessionLocal() as db:
@@ -205,6 +293,11 @@ async def run_account(task_id: int, assignment_id: int, account_id: int, live_ur
                         account.status = "available" if account.enabled else "disabled"
                     db.add(AccountLog(account_id=account_id, event_type="task_browser_stopped", detail={"task_id": task_id, "failed": failed}))
                 await db.commit()
+        if needs_replacement:
+            try:
+                await assign_replacement_account(task_id, account_id)
+            except Exception as exc:
+                print(f"[TaskWorker] 任务 {task_id} 分配替补账号失败: {type(exc).__name__}: {exc}", flush=True)
 
 
 async def run_task(task_id: int, worker_id: int):
