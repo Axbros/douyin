@@ -22,17 +22,41 @@ dnf install -y git curl ca-certificates dnf-plugins-core openssl python3
 timedatectl set-timezone Asia/Shanghai
 ```
 
-清理冲突包并安装 Docker 官方版本：
+中国云厂商提供的 CentOS 镜像通常已经配置国内 DNF 源。如果上述 `dnf` 明显缓慢，可按[清华大学 TUNA 的 CentOS Stream 9 帮助](https://mirrors.tuna.tsinghua.edu.cn/help/centos-stream/)替换系统源，再继续安装。
+
+清理冲突包，并通过阿里云 Docker CE 软件源安装 Docker 官方版本：
 
 ```bash
 dnf remove -y docker docker-client docker-client-latest docker-common \
   docker-latest docker-latest-logrotate docker-logrotate docker-engine || true
-dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+dnf config-manager --add-repo https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo
 dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 systemctl enable --now docker
 docker version
 docker compose version
 ```
+
+### 配置 Docker Hub 镜像加速
+
+Node、Python、Nginx、MySQL 和 Redis 的基础镜像来自 Docker Hub。建议使用云厂商为当前账号生成的专属镜像加速地址，不要从网上复制来历不明的公共代理。
+
+以阿里云为例：进入“容器镜像服务 ACR → 镜像工具 → 镜像加速器”，复制页面给出的专属地址，然后执行：
+
+```bash
+mkdir -p /etc/docker
+cat >/etc/docker/daemon.json <<'EOF'
+{
+  "registry-mirrors": [
+    "https://你的专属ID.mirror.aliyuncs.com"
+  ]
+}
+EOF
+systemctl daemon-reload
+systemctl restart docker
+docker info | sed -n '/Registry Mirrors/,+3p'
+```
+
+腾讯云、华为云等服务器也可以使用对应云厂商控制台提供的加速地址，`daemon.json` 格式相同。
 
 ## 3. 下载项目
 
@@ -76,6 +100,19 @@ STORAGE_STATE_ENCRYPTION_KEY={fernet_key}
 
 PLAYWRIGHT_HEADLESS=false
 TASK_WORKER_PROCESSES=2
+
+PYTHON_BASE_IMAGE=python:3.12-slim-bookworm
+PLAYWRIGHT_VERSION=1.62.0
+NODE_BASE_IMAGE=node:24-alpine
+NGINX_BASE_IMAGE=nginx:1.28-alpine
+MYSQL_IMAGE=mysql:8.4
+REDIS_IMAGE=redis:7.4-alpine
+DEBIAN_MIRROR=https://mirrors.aliyun.com/debian
+DEBIAN_SECURITY_MIRROR=https://mirrors.aliyun.com/debian-security
+PYPI_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+NPM_REGISTRY=https://registry.npmmirror.com
+PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright
+PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT=120000
 ''', encoding='utf-8')
 PY
 chmod 600 .env
@@ -83,7 +120,26 @@ chmod 600 .env
 
 真实密码只保存在 `.env`，该文件已被 Git 忽略。不要在后续更新中更换 `STORAGE_STATE_ENCRYPTION_KEY`，否则已保存的抖音登录状态将无法解密。
 
+构建过程默认使用以下国内下载源：
+
+| 配置 | 用途 | 默认来源 |
+| --- | --- | --- |
+| `DEBIAN_MIRROR` | 后端镜像内的 Debian 软件包 | 阿里云 |
+| `PYPI_INDEX_URL` | Python 包 | 清华大学 TUNA |
+| `NPM_REGISTRY` | 前端 npm 包 | npmmirror |
+| `PLAYWRIGHT_DOWNLOAD_HOST` | Chromium 二进制 | npmmirror CDN |
+| `PLAYWRIGHT_VERSION` | Python 包与 Chromium 的配套版本 | 固定版本 |
+| `*_BASE_IMAGE`、`*_IMAGE` | Docker 基础镜像 | Docker Hub 官方镜像名 |
+
+Docker 基础镜像会经过上一节配置的镜像加速器。如果有自己的 ACR/TCR 私有镜像，可把 `PYTHON_BASE_IMAGE` 等值直接改成私有仓库完整地址。所有镜像地址都在 `.env` 中覆盖，切换镜像无需修改项目代码。
+
 编辑 `.env` 可调整 `TASK_WORKER_PROCESSES`。它控制任务 Worker 进程数，一个 Worker 本身仍能并发处理多个任务账号。
+
+启动前可检查国内镜像和 Docker 拉取是否通畅：
+
+```bash
+./check_mirrors.sh
+```
 
 ## 5. 启动全部服务
 
@@ -92,7 +148,7 @@ cd /opt/douyin/deploy/centos
 ./manage.sh start
 ```
 
-第一次构建会下载 Python 包、前端依赖和 Chromium，通常需要几分钟。随后检查：
+第一次构建会通过国内镜像下载 Python 包、前端依赖和 Chromium，通常需要几分钟。随后检查：
 
 ```bash
 ./manage.sh status
@@ -224,6 +280,25 @@ Chromium 启动失败时检查并重新安装浏览器：
 docker compose --env-file .env -f compose.yaml run --rm login-worker \
   python -m playwright install chromium
 ```
+
+如果 npmmirror 暂时没有当前 Chromium 文件，可清空 `PLAYWRIGHT_DOWNLOAD_HOST` 并重新构建，Dockerfile 也会在国内镜像下载失败后自动尝试微软 CDN：
+
+```bash
+sed -i 's|^PLAYWRIGHT_DOWNLOAD_HOST=.*|PLAYWRIGHT_DOWNLOAD_HOST=|' .env
+docker compose --env-file .env -f compose.yaml build --no-cache api
+./manage.sh start
+```
+
+### 拉取 Docker 基础镜像超时
+
+先检查专属加速器是否生效：
+
+```bash
+docker info | sed -n '/Registry Mirrors/,+3p'
+docker pull redis:7.4-alpine
+```
+
+如果云厂商加速器仍无法获得某个镜像，可将该官方镜像同步到自己的 ACR/TCR 私有仓库，然后修改 `.env` 中对应的 `PYTHON_BASE_IMAGE`、`NODE_BASE_IMAGE`、`NGINX_BASE_IMAGE`、`MYSQL_IMAGE` 或 `REDIS_IMAGE`。
 
 修改 `.env` 后需要重新创建容器：
 
