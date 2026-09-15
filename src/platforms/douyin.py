@@ -158,12 +158,34 @@ class DouyinPlatform(Platform):
         except Exception:
             return False
 
+    async def login_panel_visible(self, page) -> bool:
+        """判断登录或二次验证面板是否已经打开。"""
+        selectors = (
+            '[id^="login-full-panel-"]',
+            '#uc-second-verify',
+            'img[aria-label="二维码"]',
+        )
+        for selector in selectors:
+            try:
+                candidates = page.locator(selector)
+                for index in range(await candidates.count()):
+                    if await candidates.nth(index).is_visible():
+                        return True
+            except Exception:
+                continue
+        return False
+
     async def click_login_button(self, page, log_missing: bool = True) -> bool:
-        """打开登录面板。
+        """确保登录面板已经打开。
 
         抖音前端的 CSS class/id 可能每次发布都变化，因此优先使用可访问名称和
-        可见文本定位，最后才使用 p 标签文本作为兜底。返回是否成功点击。
+        可见文本定位，最后才使用 p 标签文本作为兜底。若登录面板已经出现，
+        直接返回成功，避免重复点击被弹窗遮挡的页面按钮。
         """
+        if await self.login_panel_visible(page):
+            print("[DouyinPlatform] 登录面板已打开，无需重复点击登录按钮", flush=True)
+            return True
+
         candidates = [
             page.get_by_role("button", name="登录", exact=True),
             page.get_by_text("登录", exact=True),
@@ -175,10 +197,15 @@ class DouyinPlatform(Platform):
                 for index in range(count):
                     item = locator.nth(index)
                     if await item.is_visible() and await item.is_enabled():
-                        await item.click(timeout=5000)
+                        await item.click(timeout=1500)
                         print("[DouyinPlatform] 已点击登录按钮", flush=True)
                         return True
             except Exception as exc:
+                # 点击等待期间登录面板可能已由页面自身或前一个候选打开。此时底层
+                # “登录”文字会被面板拦截指针事件，但流程实际上已经可以读取二维码。
+                if await self.login_panel_visible(page):
+                    print("[DouyinPlatform] 登录面板已出现，跳过被遮挡的登录按钮", flush=True)
+                    return True
                 print(f"[DouyinPlatform] 登录按钮候选定位失败: {type(exc).__name__}: {exc}", flush=True)
         if log_missing:
             print("[DouyinPlatform] 未找到可点击的登录按钮，继续等待页面", flush=True)
