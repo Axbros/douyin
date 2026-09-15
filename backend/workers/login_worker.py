@@ -305,10 +305,28 @@ async def find_login_password_context(page, context=None):
 
 async def click_verification_button(container) -> bool:
     try:
-        buttons = container.locator("div").filter(has_text=re.compile(r"^\s*验证\s*$"))
-        for index in range(await buttons.count()):
-            button = buttons.nth(index)
-            if await button.is_visible():
+        selectors = (
+            '[class*="verification_component_btn-"]',
+            'div',
+        )
+        for selector in selectors:
+            buttons = container.locator(selector).filter(has_text=re.compile(r"^\s*验证\s*$"))
+            for index in range(await buttons.count()):
+                button = buttons.nth(index)
+                if not await button.is_visible():
+                    continue
+                # 按钮是 div，disabled 状态由动态 class/aria 表达，is_enabled() 无法判断。
+                # 最多等待 3 秒让 React 处理输入事件并启用按钮。
+                clickable = False
+                for _ in range(30):
+                    class_name = await button.get_attribute("class") or ""
+                    aria_disabled = await button.get_attribute("aria-disabled")
+                    if "disabled-" not in class_name and aria_disabled != "true":
+                        clickable = True
+                        break
+                    await asyncio.sleep(0.1)
+                if not clickable:
+                    continue
                 try:
                     await button.click(timeout=3000)
                 except Exception:
@@ -337,11 +355,40 @@ async def fill_and_submit_password(container, password: str) -> bool:
         input_box = await login_password_input(container)
         if input_box is None:
             return False
-        await input_box.fill(password)
-        await asyncio.sleep(0.2)
+        await input_box.fill("")
+        try:
+            # 逐字输入能稳定触发抖音受控输入框的 input/change 事件和按钮启用逻辑。
+            await input_box.press_sequentially(password, delay=35)
+        except Exception:
+            await input_box.fill(password)
+        await asyncio.sleep(0.3)
         return await click_verification_button(container)
     except Exception:
         return False
+
+
+async def password_verification_error(container) -> str | None:
+    """读取抖音页面明确展示的密码验证失败原因。"""
+    pattern = re.compile(
+        r"密码(?:错误|不正确|有误|无效)|账号或密码|验证失败|"
+        r"请重新输入(?:登录)?密码|操作失败|请求失败"
+    )
+    try:
+        candidates = container.locator("div, p, span").filter(has_text=pattern)
+        messages: list[str] = []
+        for index in range(await candidates.count()):
+            candidate = candidates.nth(index)
+            if not await candidate.is_visible():
+                continue
+            text = " ".join((await candidate.inner_text()).split())
+            if text and len(text) <= 200 and pattern.search(text):
+                messages.append(text)
+        if messages:
+            # 父级 div 也会包含子节点的错误文案，取最短文本更接近页面实际提示。
+            return min(messages, key=len)
+    except Exception:
+        pass
+    return None
 
 
 async def run_session(session_id: int):
@@ -567,13 +614,32 @@ async def run_session(session_id: int):
                             if (
                                 session.status == "password_verifying"
                                 and password_submitted_at is not None
-                                and asyncio.get_running_loop().time() - password_submitted_at >= 3
                             ):
-                                session.status = "password_required"
-                                session.failure_reason = "登录密码未通过，请重新输入"
-                                await db.commit()
-                                await publish(session.id, "password_required", reason=session.failure_reason)
-                                print(f"[LoginWorker] 登录密码未通过，等待重新提交，会话 {session_id}", flush=True)
+                                elapsed = asyncio.get_running_loop().time() - password_submitted_at
+                                explicit_error = None
+                                if elapsed >= 1:
+                                    explicit_error = await password_verification_error(password_action_scope)
+                                if explicit_error:
+                                    session.status = "password_required"
+                                    session.failure_reason = explicit_error
+                                    password_submitted_at = None
+                                    await db.commit()
+                                    await publish(session.id, "password_required", reason=session.failure_reason)
+                                    print(
+                                        f"[LoginWorker] 抖音返回登录密码验证失败，会话 {session_id}: "
+                                        f"{session.failure_reason}",
+                                        flush=True,
+                                    )
+                                elif elapsed >= 20:
+                                    session.status = "password_required"
+                                    session.failure_reason = "登录密码验证超时，未收到抖音验证结果，请重新输入"
+                                    password_submitted_at = None
+                                    await db.commit()
+                                    await publish(session.id, "password_required", reason=session.failure_reason)
+                                    print(
+                                        f"[LoginWorker] 登录密码验证超时，等待重新提交，会话 {session_id}",
+                                        flush=True,
+                                    )
                             if session.status == "password_required":
                                 encrypted_password = await redis_client.lpop(f"douyin:login:password:{session_id}")
                                 if encrypted_password:
