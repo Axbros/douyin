@@ -1,4 +1,5 @@
 from datetime import datetime
+from secrets import token_hex
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -7,12 +8,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db, redis_client
 from app.core.platform_settings import get_platform_settings
+from app.core.subscriptions import get_customer_plan
 from app.dependencies import customer_user
-from app.models import AccountLog, AccountLoginSession, CommentLog, DouyinAccount, Script, Task, TaskAccount, TaskScript, User
+from app.models import (AccountLog, AccountLoginSession, CommentLog, DouyinAccount, PurchaseOrder, Script,
+                        SubscriptionPlan, Task, TaskAccount, TaskScript, User)
 from app.schemas import (AccountResponse, CommentLogResponse, DouyinAccountUpdate, LoginPasswordRequest,
                          LoginSessionResponse, LoginVerificationCodeRequest, LoginVerificationMethodRequest,
-                         PlatformSettingsResponse, ScriptBulkCreate, ScriptCreate, ScriptResponse,
-                         ScriptUpdate, TaskAccountResponse, TaskCreate, TaskResponse)
+                         CustomerSubscriptionResponse, PlatformSettingsResponse, PurchaseOrderCreate,
+                         PurchaseOrderResponse, ScriptBulkCreate, ScriptCreate, ScriptResponse,
+                         ScriptUpdate, SubscriptionPlanResponse, TaskAccountResponse, TaskCreate, TaskResponse)
 
 router = APIRouter(prefix="/api/customer", tags=["customer"])
 
@@ -45,6 +49,66 @@ async def customer_platform_settings(user: Annotated[User, Depends(customer_user
     return await get_platform_settings(db)
 
 
+@router.get("/subscription-plans", response_model=list[SubscriptionPlanResponse])
+async def list_subscription_plans(user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    return list(await db.scalars(select(SubscriptionPlan).where(
+        SubscriptionPlan.enabled.is_(True), SubscriptionPlan.deleted_at.is_(None),
+    ).order_by(SubscriptionPlan.tier_level.asc())))
+
+
+@router.get("/subscription", response_model=CustomerSubscriptionResponse)
+async def customer_subscription(user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    plan = await get_customer_plan(db, user)
+    return CustomerSubscriptionResponse(
+        plan=plan, expires_at=user.expires_at,
+        extra_account_quota=user.extra_douyin_account_quota,
+        total_account_quota=plan.base_douyin_account_quota + user.extra_douyin_account_quota,
+    )
+
+
+@router.get("/purchase-orders", response_model=list[PurchaseOrderResponse])
+async def list_purchase_orders(user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    return list(await db.scalars(select(PurchaseOrder).where(
+        PurchaseOrder.customer_id == user.id, PurchaseOrder.deleted_at.is_(None),
+    ).order_by(PurchaseOrder.id.desc()).limit(100)))
+
+
+@router.post("/purchase-orders", response_model=PurchaseOrderResponse, status_code=201)
+async def create_purchase_order(payload: PurchaseOrderCreate, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    pending = await db.scalar(select(PurchaseOrder.id).where(
+        PurchaseOrder.customer_id == user.id, PurchaseOrder.order_type == payload.order_type,
+        PurchaseOrder.status == "pending", PurchaseOrder.deleted_at.is_(None),
+    ))
+    if pending:
+        raise HTTPException(409, "已有同类型申请正在处理中")
+    current_plan = await get_customer_plan(db, user)
+    plan = None
+    amount_cents = None
+    if payload.order_type == "plan_upgrade":
+        plan = await db.scalar(select(SubscriptionPlan).where(
+            SubscriptionPlan.id == payload.plan_id, SubscriptionPlan.enabled.is_(True),
+            SubscriptionPlan.deleted_at.is_(None),
+        ))
+        if not plan:
+            raise HTTPException(404, "套餐不存在或已下架")
+        if plan.tier_level <= current_plan.tier_level:
+            raise HTTPException(409, "只能申请升级到更高等级的套餐")
+        amount_cents = plan.price_cents
+    else:
+        if current_plan.extra_account_price_cents is not None:
+            amount_cents = current_plan.extra_account_price_cents * payload.quota_quantity
+    order = PurchaseOrder(
+        order_no=f"PO{datetime.now():%Y%m%d%H%M%S}{token_hex(3).upper()}",
+        customer_id=user.id, order_type=payload.order_type,
+        plan_id=plan.id if plan else None, quota_quantity=payload.quota_quantity,
+        amount_cents=amount_cents, status="pending",
+    )
+    db.add(order)
+    await db.commit()
+    await db.refresh(order)
+    return order
+
+
 @router.get("/douyin-accounts", response_model=list[AccountResponse])
 async def list_owned_accounts(user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
     return list(await db.scalars(select(DouyinAccount).where(
@@ -55,12 +119,12 @@ async def list_owned_accounts(user: Annotated[User, Depends(customer_user)], db:
 
 @router.get("/douyin-account-quota")
 async def owned_account_quota(user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
-    settings = await get_platform_settings(db)
+    plan = await get_customer_plan(db, user)
     used = await db.scalar(select(func.count(DouyinAccount.id)).where(
         DouyinAccount.ownership_type == "customer", DouyinAccount.owner_customer_id == user.id,
         DouyinAccount.deleted_at.is_(None),
     ))
-    base = settings["default_customer_account_quota"]
+    base = plan.base_douyin_account_quota
     return {"base_quota": base, "extra_quota": user.extra_douyin_account_quota,
             "total_quota": base + user.extra_douyin_account_quota, "used": used}
 
@@ -68,12 +132,12 @@ async def owned_account_quota(user: Annotated[User, Depends(customer_user)], db:
 @router.post("/douyin-accounts", response_model=AccountResponse, status_code=201)
 async def create_owned_account(display_name: str, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
     locked_user = await db.scalar(select(User).where(User.id == user.id).with_for_update())
-    settings = await get_platform_settings(db)
+    plan = await get_customer_plan(db, locked_user)
     used = await db.scalar(select(func.count(DouyinAccount.id)).where(
         DouyinAccount.ownership_type == "customer", DouyinAccount.owner_customer_id == user.id,
         DouyinAccount.deleted_at.is_(None),
     ))
-    quota = settings["default_customer_account_quota"] + locked_user.extra_douyin_account_quota
+    quota = plan.base_douyin_account_quota + locked_user.extra_douyin_account_quota
     if used >= quota:
         raise HTTPException(409, f"自有抖音账号额度已用完（{used}/{quota}），请购买额外额度")
     account = DouyinAccount(display_name=display_name.strip() or "我的抖音账号", ownership_type="customer",
@@ -240,22 +304,25 @@ async def delete_script(script_id: int, user: Annotated[User, Depends(customer_u
 async def create_task(payload: TaskCreate, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
     platform_settings = await get_platform_settings(db)
     # 锁定客户行，避免同一客户并发请求同时创建多个活动任务。
-    await db.scalar(select(User).where(User.id == user.id).with_for_update())
+    locked_user = await db.scalar(select(User).where(User.id == user.id).with_for_update())
+    plan = await get_customer_plan(db, locked_user)
+    active_task_limit = plan.max_active_tasks
     active_task_count = await db.scalar(select(func.count(Task.id)).where(
         Task.customer_id == user.id,
         Task.status.in_(("pending", "running", "paused")),
         Task.deleted_at.is_(None),
     ))
-    if active_task_count >= platform_settings["max_active_tasks_per_customer"]:
-        raise HTTPException(409, f"当前活动任务已达到上限（{platform_settings['max_active_tasks_per_customer']} 个）")
+    if active_task_count >= active_task_limit:
+        raise HTTPException(409, f"当前套餐的活动任务已达到上限（{active_task_limit} 个）")
     if payload.max_interval_seconds < payload.min_interval_seconds:
         raise HTTPException(422, "最大间隔不能小于最小间隔")
     if payload.min_interval_seconds < platform_settings["comment_min_interval_seconds"] or payload.max_interval_seconds > platform_settings["comment_max_interval_seconds"]:
         raise HTTPException(422, f"评论间隔必须在 {platform_settings['comment_min_interval_seconds']}–{platform_settings['comment_max_interval_seconds']} 秒之间")
     if len(set(payload.script_ids)) != len(payload.script_ids):
         raise HTTPException(422, "话术不能重复选择")
-    if len(payload.script_ids) > platform_settings["max_scripts_per_task"]:
-        raise HTTPException(422, f"单个任务最多选择 {platform_settings['max_scripts_per_task']} 条话术")
+    script_limit = plan.max_scripts_per_task
+    if len(payload.script_ids) > script_limit:
+        raise HTTPException(422, f"当前套餐单个任务最多选择 {script_limit} 条话术")
     scripts = list(await db.scalars(select(Script).where(
         Script.id.in_(payload.script_ids), Script.customer_id == user.id,
         Script.status == "approved", Script.deleted_at.is_(None),
@@ -278,11 +345,10 @@ async def create_task(payload: TaskCreate, user: Annotated[User, Depends(custome
         if len(accounts) != len(account_ids):
             raise HTTPException(409, "所选自有账号中存在未登录、不可用、忙碌或不属于您的账号")
         target_account_count = len(accounts)
-        billing_amount_cents = platform_settings["customer_account_task_price_cents"]
     else:
         if payload.account_ids:
             raise HTTPException(422, "平台账号模式不需要选择账号")
-        target_account_count = platform_settings["default_target_account_count"]
+        target_account_count = plan.platform_account_count
         accounts = list(await db.scalars(select(DouyinAccount).where(
             DouyinAccount.ownership_type == "platform", DouyinAccount.enabled.is_(True),
             DouyinAccount.status == "available", DouyinAccount.current_task_id.is_(None),
@@ -290,9 +356,8 @@ async def create_task(payload: TaskCreate, user: Annotated[User, Depends(custome
         ).order_by(func.rand()).limit(target_account_count).with_for_update()))
         if len(accounts) < target_account_count:
             raise HTTPException(409, f"平台可用抖音账号不足，需要 {target_account_count} 个，当前只有 {len(accounts)} 个")
-        billing_amount_cents = platform_settings["platform_account_task_price_cents"]
     task = Task(customer_id=user.id, room_id=payload.room_id, target_account_count=target_account_count,
-                account_source=payload.account_source, billing_amount_cents=billing_amount_cents,
+                account_source=payload.account_source,
                 script_order_mode=payload.script_order_mode,
                 min_interval_seconds=payload.min_interval_seconds, max_interval_seconds=payload.max_interval_seconds)
     db.add(task)

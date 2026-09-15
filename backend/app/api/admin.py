@@ -22,7 +22,8 @@ from app.core.crypto import encrypt_transient_secret
 from app.core.platform_settings import get_platform_settings, update_platform_settings
 from app.core.security import hash_password
 from app.dependencies import admin_user
-from app.models import AccountLoginSession, AccountLog, CommentLog, DouyinAccount, Script, SensitiveWord, Task, TaskAccount, User, Worker
+from app.models import (AccountLoginSession, AccountLog, CommentLog, DouyinAccount, PurchaseOrder, Script,
+                        SensitiveWord, SubscriptionPlan, Task, TaskAccount, User, Worker)
 from app.schemas import (
     AccountResponse,
     AccountLogResponse,
@@ -40,12 +41,16 @@ from app.schemas import (
     LoginVerificationMethodRequest,
     PlatformSettingsResponse,
     PlatformSettingsUpdate,
+    PurchaseOrderResponse,
+    PurchaseOrderReview,
     ScriptResponse, ScriptBatchReviewRequest,
     ServerStatusResponse,
     ServiceStatus,
     SensitiveWordCreate,
     SensitiveWordResponse,
     SensitiveWordUpdate,
+    SubscriptionPlanResponse,
+    SubscriptionPlanUpdate,
     TaskAccountResponse,
     TaskResponse,
 )
@@ -160,12 +165,19 @@ async def create_customer(payload: AdminCustomerCreate, user: Annotated[User, De
         raise HTTPException(422, "登录名和客户名称不能为空")
     if await db.scalar(select(User.id).where(User.login == login)):
         raise HTTPException(409, "登录名已存在")
+    standard_plan_id = await db.scalar(select(SubscriptionPlan.id).where(
+        SubscriptionPlan.code == "standard", SubscriptionPlan.enabled.is_(True),
+        SubscriptionPlan.deleted_at.is_(None),
+    ))
+    if not standard_plan_id:
+        raise HTTPException(503, "平台尚未配置标准套餐")
     customer = User(
         role="customer",
         login=login,
         display_name=display_name,
         password_hash=hash_password(payload.password),
         status="disabled",
+        subscription_plan_id=standard_plan_id,
     )
     db.add(customer)
     await db.commit()
@@ -262,6 +274,74 @@ async def delete_customer(customer_id: int, user: Annotated[User, Depends(admin_
     customer.status = "disabled"
     customer.deleted_at = datetime.now()
     await db.commit()
+
+
+@router.get("/subscription-plans", response_model=list[SubscriptionPlanResponse])
+async def admin_subscription_plans(user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    return list(await db.scalars(select(SubscriptionPlan).where(
+        SubscriptionPlan.deleted_at.is_(None),
+    ).order_by(SubscriptionPlan.tier_level.asc())))
+
+
+@router.patch("/subscription-plans/{plan_id}", response_model=SubscriptionPlanResponse)
+async def update_subscription_plan(plan_id: int, payload: SubscriptionPlanUpdate, user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    plan = await db.scalar(select(SubscriptionPlan).where(
+        SubscriptionPlan.id == plan_id, SubscriptionPlan.deleted_at.is_(None),
+    ))
+    if not plan:
+        raise HTTPException(404, "套餐不存在")
+    values = payload.model_dump(exclude_unset=True)
+    if "name" in values:
+        values["name"] = values["name"].strip()
+    for name, value in values.items():
+        setattr(plan, name, value)
+    await db.commit()
+    await db.refresh(plan)
+    return plan
+
+
+@router.get("/purchase-orders", response_model=list[PurchaseOrderResponse])
+async def admin_purchase_orders(user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    return list(await db.scalars(select(PurchaseOrder).where(
+        PurchaseOrder.deleted_at.is_(None),
+    ).order_by(PurchaseOrder.id.desc()).limit(500)))
+
+
+@router.post("/purchase-orders/{order_id}/review", response_model=PurchaseOrderResponse)
+async def review_purchase_order(order_id: int, payload: PurchaseOrderReview, user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    order = await db.scalar(select(PurchaseOrder).where(
+        PurchaseOrder.id == order_id, PurchaseOrder.deleted_at.is_(None),
+    ).with_for_update())
+    if not order:
+        raise HTTPException(404, "购买申请不存在")
+    if order.status != "pending":
+        raise HTTPException(409, "该购买申请已经处理")
+    if payload.action == "approve":
+        customer = await db.scalar(select(User).where(User.id == order.customer_id).with_for_update())
+        if not customer or customer.role != "customer" or customer.deleted_at is not None:
+            raise HTTPException(409, "客户不存在或已删除")
+        if order.order_type == "plan_upgrade":
+            plan = await db.scalar(select(SubscriptionPlan).where(
+                SubscriptionPlan.id == order.plan_id, SubscriptionPlan.enabled.is_(True),
+                SubscriptionPlan.deleted_at.is_(None),
+            ))
+            if not plan:
+                raise HTTPException(409, "目标套餐不存在或已下架")
+            customer.subscription_plan_id = plan.id
+            base = customer.expires_at if customer.expires_at and customer.expires_at > datetime.now() else datetime.now()
+            customer.expires_at = base + timedelta(days=plan.duration_days)
+            customer.status = "active"
+        elif order.order_type == "account_quota":
+            customer.extra_douyin_account_quota += order.quota_quantity or 0
+        order.status = "approved"
+    else:
+        order.status = "rejected"
+    order.reviewed_by = user.id
+    order.reviewed_at = datetime.now()
+    order.note = (payload.note or "").strip() or None
+    await db.commit()
+    await db.refresh(order)
+    return order
 
 
 @router.get("/tasks", response_model=list[TaskResponse])

@@ -21,6 +21,7 @@ class UserResponse(BaseModel):
     status: str
     expires_at: datetime | None = None
     extra_douyin_account_quota: int = 0
+    subscription_plan_id: int | None = None
 
     model_config = {"from_attributes": True}
 
@@ -53,6 +54,7 @@ class AdminCustomerResponse(BaseModel):
     last_login_at: datetime | None = None
     expires_at: datetime | None = None
     extra_douyin_account_quota: int = 0
+    subscription_plan_id: int | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -134,7 +136,6 @@ class TaskResponse(BaseModel):
     status: str
     target_account_count: int
     account_source: str
-    billing_amount_cents: int
     script_order_mode: str
     min_interval_seconds: int
     max_interval_seconds: int
@@ -283,33 +284,21 @@ class ServerStatusResponse(BaseModel):
 
 
 class PlatformSettingsResponse(BaseModel):
-    default_target_account_count: int
-    max_active_tasks_per_customer: int
     comment_min_interval_seconds: int
     comment_max_interval_seconds: int
-    max_scripts_per_task: int
     script_bulk_import_limit: int
     qr_expire_minutes: int
     worker_heartbeat_timeout_seconds: int
     account_reclaim_seconds: int
-    default_customer_account_quota: int
-    customer_account_task_price_cents: int
-    platform_account_task_price_cents: int
 
 
 class PlatformSettingsUpdate(PlatformSettingsResponse):
-    default_target_account_count: int = Field(ge=1, le=100)
-    max_active_tasks_per_customer: int = Field(ge=1, le=20)
     comment_min_interval_seconds: int = Field(ge=5, le=3600)
     comment_max_interval_seconds: int = Field(ge=5, le=3600)
-    max_scripts_per_task: int = Field(ge=1, le=500)
     script_bulk_import_limit: int = Field(ge=1, le=1000)
     qr_expire_minutes: int = Field(ge=1, le=30)
     worker_heartbeat_timeout_seconds: int = Field(ge=10, le=300)
     account_reclaim_seconds: int = Field(ge=30, le=1800)
-    default_customer_account_quota: int = Field(ge=0, le=100)
-    customer_account_task_price_cents: int = Field(ge=0, le=100000000)
-    platform_account_task_price_cents: int = Field(ge=0, le=100000000)
 
     @model_validator(mode="after")
     def validate_ranges(self):
@@ -317,6 +306,81 @@ class PlatformSettingsUpdate(PlatformSettingsResponse):
             raise ValueError("评论最大间隔不能小于最小间隔")
         if self.account_reclaim_seconds < self.worker_heartbeat_timeout_seconds:
             raise ValueError("账号回收时间不能小于 Worker 心跳超时")
-        if self.platform_account_task_price_cents <= self.customer_account_task_price_cents:
-            raise ValueError("平台账号模式价格必须高于自有账号模式价格")
+        return self
+
+
+class SubscriptionPlanResponse(BaseModel):
+    id: int
+    code: str
+    name: str
+    tier_level: int
+    duration_days: int
+    base_douyin_account_quota: int
+    platform_account_count: int
+    max_active_tasks: int
+    max_scripts_per_task: int
+    price_cents: int | None = None
+    extra_account_price_cents: int | None = None
+    features: list | None = None
+    enabled: bool
+
+    model_config = {"from_attributes": True}
+
+
+class SubscriptionPlanUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=60)
+    base_douyin_account_quota: int | None = Field(default=None, ge=0, le=1000)
+    platform_account_count: int | None = Field(default=None, ge=1, le=100)
+    max_active_tasks: int | None = Field(default=None, ge=1, le=20)
+    max_scripts_per_task: int | None = Field(default=None, ge=1, le=500)
+    price_cents: int | None = Field(default=None, ge=0, le=100000000)
+    extra_account_price_cents: int | None = Field(default=None, ge=0, le=100000000)
+    enabled: bool | None = None
+
+
+class CustomerSubscriptionResponse(BaseModel):
+    plan: SubscriptionPlanResponse
+    expires_at: datetime | None = None
+    extra_account_quota: int
+    total_account_quota: int
+
+
+class PurchaseOrderCreate(BaseModel):
+    order_type: str = Field(pattern="^(plan_upgrade|account_quota)$")
+    plan_id: int | None = None
+    quota_quantity: int | None = Field(default=None, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def validate_order(self):
+        if self.order_type == "plan_upgrade" and self.plan_id is None:
+            raise ValueError("升级套餐必须选择套餐")
+        if self.order_type == "account_quota" and self.quota_quantity is None:
+            raise ValueError("购买账号额度必须填写数量")
+        return self
+
+
+class PurchaseOrderResponse(BaseModel):
+    id: int
+    order_no: str
+    customer_id: int
+    order_type: str
+    plan_id: int | None = None
+    quota_quantity: int | None = None
+    amount_cents: int | None = None
+    status: str
+    note: str | None = None
+    reviewed_at: datetime | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class PurchaseOrderReview(BaseModel):
+    action: str = Field(pattern="^(approve|reject)$")
+    note: str | None = Field(default=None, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_rejection(self):
+        if self.action == "reject" and not (self.note or "").strip():
+            raise ValueError("拒绝申请时必须填写原因")
         return self

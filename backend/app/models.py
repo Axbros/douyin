@@ -26,6 +26,7 @@ class User(TimestampMixin, Base):
     last_login_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=3), nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=3), nullable=True)
     extra_douyin_account_quota: Mapped[int] = mapped_column(Integer, default=0)
+    subscription_plan_id: Mapped[int | None] = mapped_column(ForeignKey("subscription_plans.id"), nullable=True)
 
 
 class Script(TimestampMixin, Base):
@@ -100,7 +101,6 @@ class Task(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(20), default="pending")
     target_account_count: Mapped[int] = mapped_column(Integer, default=3)
     account_source: Mapped[str] = mapped_column(String(20), default="platform")
-    billing_amount_cents: Mapped[int] = mapped_column(Integer, default=0)
     script_order_mode: Mapped[str] = mapped_column(String(20), default="random")
     min_interval_seconds: Mapped[int] = mapped_column(Integer, default=20)
     max_interval_seconds: Mapped[int] = mapped_column(Integer, default=50)
@@ -116,6 +116,36 @@ class TaskScript(TimestampMixin, Base):
     script_id: Mapped[int] = mapped_column(ForeignKey("scripts.id"))
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
     __table_args__ = (UniqueConstraint("task_id", "script_id", name="uk_task_scripts_pair"),)
+
+
+class SubscriptionPlan(TimestampMixin, Base):
+    __tablename__ = "subscription_plans"
+    code: Mapped[str] = mapped_column(String(30), unique=True)
+    name: Mapped[str] = mapped_column(String(60))
+    tier_level: Mapped[int] = mapped_column(Integer)
+    duration_days: Mapped[int] = mapped_column(Integer, default=30)
+    base_douyin_account_quota: Mapped[int] = mapped_column(Integer, default=3)
+    platform_account_count: Mapped[int] = mapped_column(Integer, default=3)
+    max_active_tasks: Mapped[int] = mapped_column(Integer, default=1)
+    max_scripts_per_task: Mapped[int] = mapped_column(Integer, default=100)
+    price_cents: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    extra_account_price_cents: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    features: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    enabled: Mapped[bool] = mapped_column(default=True)
+
+
+class PurchaseOrder(TimestampMixin, Base):
+    __tablename__ = "purchase_orders"
+    order_no: Mapped[str] = mapped_column(String(40), unique=True)
+    customer_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    order_type: Mapped[str] = mapped_column(String(30))
+    plan_id: Mapped[int | None] = mapped_column(ForeignKey("subscription_plans.id"), nullable=True)
+    quota_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    amount_cents: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    reviewed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=3), nullable=True)
+    note: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
 
 class TaskAccount(TimestampMixin, Base):

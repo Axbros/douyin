@@ -87,11 +87,21 @@ const rejectForm = ref({ id: 0, title: '', reason: '' })
 const rejectBatchMode = ref(false)
 const selectedAdminScripts = ref<any[]>([])
 const batchReviewLoading = ref(false)
+const subscriptionPlans = ref<any[]>([])
+const planSavingId = ref<number | null>(null)
+const adminPurchaseOrders = ref<any[]>([])
+const purchaseOrderStatus = ref('')
+const purchaseOrderKeyword = ref('')
 const customerMe = ref<any>(null)
 const customerScripts = ref<any[]>([])
 const customerTasks = ref<any[]>([])
 const customerAccounts = ref<any[]>([])
 const customerAccountQuota = ref({ base_quota: 3, extra_quota: 0, total_quota: 3, used: 0 })
+const customerSubscription = ref<any>(null)
+const customerPurchaseOrders = ref<any[]>([])
+const purchaseSubmitting = ref(false)
+const quotaPurchaseVisible = ref(false)
+const quotaPurchaseQuantity = ref(1)
 const addCustomerAccountVisible = ref(false)
 const addCustomerAccountLoading = ref(false)
 const newCustomerAccountName = ref('')
@@ -116,18 +126,12 @@ const serverLoading = ref(false)
 let serverStatusTimer: number | null = null
 const platformSettingsLoading = ref(false)
 const platformSettings = ref({
-  default_target_account_count: 3,
-  max_active_tasks_per_customer: 1,
   comment_min_interval_seconds: 5,
   comment_max_interval_seconds: 3600,
-  max_scripts_per_task: 100,
   script_bulk_import_limit: 200,
   qr_expire_minutes: 5,
   worker_heartbeat_timeout_seconds: 20,
   account_reclaim_seconds: 60,
-  default_customer_account_quota: 3,
-  customer_account_task_price_cents: 1000,
-  platform_account_task_price_cents: 3000,
 })
 
 const filteredAccounts = computed(() => accounts.value.filter(account =>
@@ -148,6 +152,10 @@ const filteredScripts = computed(() => adminScripts.value.filter(script =>
   (!scriptKeyword.value || script.title.includes(scriptKeyword.value) || script.content.includes(scriptKeyword.value) || script.customer_login.includes(scriptKeyword.value)) &&
   (!scriptStatus.value || script.status === scriptStatus.value),
 ))
+const filteredPurchaseOrders = computed(() => adminPurchaseOrders.value.filter(order =>
+  (!purchaseOrderStatus.value || order.status === purchaseOrderStatus.value) &&
+  (!purchaseOrderKeyword.value || order.order_no.includes(purchaseOrderKeyword.value) || customerName(order.customer_id).includes(purchaseOrderKeyword.value)),
+))
 const paginatedAccounts = computed(() => filteredAccounts.value.slice((accountPage.value - 1) * accountPageSize.value, accountPage.value * accountPageSize.value))
 const paginatedTasks = computed(() => filteredTasks.value.slice((taskPage.value - 1) * taskPageSize.value, taskPage.value * taskPageSize.value))
 const paginatedWords = computed(() => filteredWords.value.slice((wordPage.value - 1) * wordPageSize.value, wordPage.value * wordPageSize.value))
@@ -159,7 +167,11 @@ const wordTableIndex = (index: number) => (wordPage.value - 1) * wordPageSize.va
 const customerTableIndex = (index: number) => (customerPage.value - 1) * customerPageSize.value + index + 1
 const scriptTableIndex = (index: number) => (scriptPage.value - 1) * scriptPageSize.value + index + 1
 const approvedCustomerScripts = computed(() => customerScripts.value.filter(script => script.status === 'approved'))
-const selectableTaskScripts = computed(() => approvedCustomerScripts.value.slice(0, platformSettings.value.max_scripts_per_task))
+const currentPlan = computed(() => customerSubscription.value?.plan || null)
+const taskScriptLimit = computed(() => currentPlan.value?.max_scripts_per_task || 100)
+const activeTaskLimit = computed(() => currentPlan.value?.max_active_tasks || 1)
+const platformTaskAccountCount = computed(() => currentPlan.value?.platform_account_count || 3)
+const selectableTaskScripts = computed(() => approvedCustomerScripts.value.slice(0, taskScriptLimit.value))
 const allTaskScriptsSelected = computed(() => selectableTaskScripts.value.length > 0 && selectableTaskScripts.value.every(script => taskForm.value.script_ids.includes(script.id)))
 const activeCustomerTask = computed(() => customerTasks.value.find(task => ['pending', 'running', 'paused'].includes(task.status)))
 const activeCustomerTaskCount = computed(() => customerTasks.value.filter(task => ['pending', 'running', 'paused'].includes(task.status)).length)
@@ -167,7 +179,8 @@ const availableTaskAccounts = computed(() => accounts.value.filter(account => ac
   !selectedAdminTask.value || (selectedAdminTask.value.account_source === 'platform' ? account.ownership_type === 'platform' : account.ownership_type === 'customer' && account.owner_customer_id === selectedAdminTask.value.customer_id)
 )))
 const availableCustomerAccounts = computed(() => customerAccounts.value.filter(account => account.enabled && account.status === 'available' && !account.current_task_id))
-const selectedTaskPrice = computed(() => taskForm.value.account_source === 'customer' ? platformSettings.value.customer_account_task_price_cents : platformSettings.value.platform_account_task_price_cents)
+const planName = (planId: number | null | undefined) => subscriptionPlans.value.find(plan => plan.id === planId)?.name || '标准版'
+const customerPlanQuota = (customer: any) => (subscriptionPlans.value.find(plan => plan.id === customer.subscription_plan_id)?.base_douyin_account_quota || 3) + (customer.extra_douyin_account_quota || 0)
 const customerReadySteps = computed(() => [
   { label: '准备并提交话术', done: approvedCustomerScripts.value.length > 0, detail: approvedCustomerScripts.value.length ? `已有 ${approvedCustomerScripts.value.length} 条审核通过` : '至少需要一条审核通过的话术', target: 'scripts' },
   { label: '选择账号模式', done: true, detail: '可使用平台账号，或添加自己的抖音号', target: 'accounts' },
@@ -289,13 +302,15 @@ async function load() {
   if (role.value !== 'admin') return
   loading.value = true
   try {
-    const [accountResponse, taskResponse, wordResponse, customerResponse, scriptResponse, settingResponse] = await Promise.all([
+    const [accountResponse, taskResponse, wordResponse, customerResponse, scriptResponse, settingResponse, planResponse, orderResponse] = await Promise.all([
       fetch('/api/admin/douyin-accounts', { headers: authHeaders() }),
       fetch('/api/admin/tasks', { headers: authHeaders() }),
       fetch('/api/admin/sensitive-words', { headers: authHeaders() }),
       fetch('/api/admin/customers', { headers: authHeaders() }),
       fetch('/api/admin/scripts', { headers: authHeaders() }),
       fetch('/api/admin/platform-settings', { headers: authHeaders() }),
+      fetch('/api/admin/subscription-plans', { headers: authHeaders() }),
+      fetch('/api/admin/purchase-orders', { headers: authHeaders() }),
     ])
     if (accountResponse.ok) accounts.value = await accountResponse.json()
     if (taskResponse.ok) tasks.value = await taskResponse.json()
@@ -303,7 +318,9 @@ async function load() {
     if (customerResponse.ok) customers.value = await customerResponse.json()
     if (scriptResponse.ok) adminScripts.value = await scriptResponse.json()
     if (settingResponse.ok) platformSettings.value = await settingResponse.json()
-    if ([accountResponse, taskResponse, wordResponse, customerResponse, scriptResponse, settingResponse].some(response => response.status === 401)) logout()
+    if (planResponse.ok) subscriptionPlans.value = await planResponse.json()
+    if (orderResponse.ok) adminPurchaseOrders.value = await orderResponse.json()
+    if ([accountResponse, taskResponse, wordResponse, customerResponse, scriptResponse, settingResponse, planResponse, orderResponse].some(response => response.status === 401)) logout()
   } finally { loading.value = false }
 }
 
@@ -319,6 +336,24 @@ async function savePlatformSettings() {
     if (!response.ok) { notify(data.detail?.[0]?.msg || data.detail || '保存平台配置失败', 'error'); return }
     platformSettings.value = data; notify('平台配置已保存并立即生效', 'success')
   } finally { platformSettingsLoading.value = false }
+}
+async function saveSubscriptionPlan(plan: any) {
+  planSavingId.value = plan.id
+  try {
+    const payload = {
+      name: plan.name,
+      base_douyin_account_quota: plan.base_douyin_account_quota,
+      platform_account_count: plan.platform_account_count,
+      max_active_tasks: plan.max_active_tasks,
+      max_scripts_per_task: plan.max_scripts_per_task,
+      price_cents: plan.price_cents,
+      extra_account_price_cents: plan.extra_account_price_cents,
+      enabled: plan.enabled,
+    }
+    const response = await fetch(`/api/admin/subscription-plans/${plan.id}`, { method: 'PATCH', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+    if (!response.ok) { notify((await response.json()).detail || '保存套餐失败', 'error'); return }
+    notify(`${plan.name}配置已保存`, 'success'); await load()
+  } finally { planSavingId.value = null }
 }
 
 async function loadServerStatus() {
@@ -645,21 +680,27 @@ async function loadCustomer() {
   if (role.value !== 'customer') return
   customerLoading.value = true
   try {
-    const [meResponse, scriptResponse, taskResponse, settingResponse, accountResponse, quotaResponse] = await Promise.all([
+    const [meResponse, scriptResponse, taskResponse, settingResponse, accountResponse, quotaResponse, subscriptionResponse, planResponse, orderResponse] = await Promise.all([
       fetch('/api/auth/me', { headers: authHeaders() }),
       fetch('/api/customer/scripts', { headers: authHeaders() }),
       fetch('/api/customer/tasks', { headers: authHeaders() }),
       fetch('/api/customer/platform-settings', { headers: authHeaders() }),
       fetch('/api/customer/douyin-accounts', { headers: authHeaders() }),
       fetch('/api/customer/douyin-account-quota', { headers: authHeaders() }),
+      fetch('/api/customer/subscription', { headers: authHeaders() }),
+      fetch('/api/customer/subscription-plans', { headers: authHeaders() }),
+      fetch('/api/customer/purchase-orders', { headers: authHeaders() }),
     ])
-    if ([meResponse, scriptResponse, taskResponse, settingResponse, accountResponse, quotaResponse].some(response => response.status === 401)) { logout(); return }
+    if ([meResponse, scriptResponse, taskResponse, settingResponse, accountResponse, quotaResponse, subscriptionResponse, planResponse, orderResponse].some(response => response.status === 401)) { logout(); return }
     if (meResponse.ok) customerMe.value = await meResponse.json()
     if (scriptResponse.ok) customerScripts.value = await scriptResponse.json()
     if (taskResponse.ok) customerTasks.value = await taskResponse.json()
     if (settingResponse.ok) platformSettings.value = await settingResponse.json()
     if (accountResponse.ok) customerAccounts.value = await accountResponse.json()
     if (quotaResponse.ok) customerAccountQuota.value = await quotaResponse.json()
+    if (subscriptionResponse.ok) customerSubscription.value = await subscriptionResponse.json()
+    if (planResponse.ok) subscriptionPlans.value = await planResponse.json()
+    if (orderResponse.ok) customerPurchaseOrders.value = await orderResponse.json()
   } finally { customerLoading.value = false }
 }
 async function importScripts() {
@@ -700,7 +741,7 @@ async function deleteCustomerScript(row: any) {
   notify('话术已删除', 'success'); await loadCustomer()
 }
 function openCreateTask() {
-  if (activeCustomerTaskCount.value >= platformSettings.value.max_active_tasks_per_customer) { notify(`活动任务已达到上限（${platformSettings.value.max_active_tasks_per_customer} 个）`, 'warning'); return }
+  if (activeCustomerTaskCount.value >= activeTaskLimit.value) { notify(`当前套餐的活动任务已达到上限（${activeTaskLimit.value} 个）`, 'warning'); return }
   if (!approvedCustomerScripts.value.length) { notify('没有审核通过的话术，暂时不能创建任务', 'warning'); return }
   const minInterval = Math.min(Math.max(20, platformSettings.value.comment_min_interval_seconds), platformSettings.value.comment_max_interval_seconds)
   const maxInterval = Math.min(Math.max(50, minInterval), platformSettings.value.comment_max_interval_seconds)
@@ -711,20 +752,20 @@ function toggleAllTaskScripts() {
   taskForm.value.script_ids = allTaskScriptsSelected.value ? [] : selectableTaskScripts.value.map(script => script.id)
 }
 function handleTaskScriptSelection(values: number[]) {
-  if (values.length <= platformSettings.value.max_scripts_per_task) return
-  taskForm.value.script_ids = values.slice(0, platformSettings.value.max_scripts_per_task)
-  notify(`单个任务最多选择 ${platformSettings.value.max_scripts_per_task} 条话术`, 'warning')
+  if (values.length <= taskScriptLimit.value) return
+  taskForm.value.script_ids = values.slice(0, taskScriptLimit.value)
+  notify(`当前套餐单个任务最多选择 ${taskScriptLimit.value} 条话术`, 'warning')
 }
 async function createCustomerTask() {
   const form = taskForm.value
   if (!form.room_id.trim() || !form.script_ids.length) { notify('请填写直播间 ID 并选择话术', 'warning'); return }
   if (form.account_source === 'customer' && !form.account_ids.length) { notify('请选择至少一个已登录且可用的自有抖音账号', 'warning'); return }
-  if (form.script_ids.length > platformSettings.value.max_scripts_per_task) { notify(`单个任务最多选择 ${platformSettings.value.max_scripts_per_task} 条话术`, 'warning'); return }
+  if (form.script_ids.length > taskScriptLimit.value) { notify(`当前套餐单个任务最多选择 ${taskScriptLimit.value} 条话术`, 'warning'); return }
   if (form.max_interval_seconds < form.min_interval_seconds) { notify('最大间隔不能小于最小间隔', 'warning'); return }
   const modeName = form.account_source === 'customer' ? '我的账号' : '平台账号'
   const orderModeName = form.script_order_mode === 'sequential' ? '顺序评论' : '随机评论'
-  const accountCount = form.account_source === 'customer' ? form.account_ids.length : platformSettings.value.default_target_account_count
-  const confirmed = await ElMessageBox.confirm(`将使用${modeName}（${accountCount} 个）执行${orderModeName}，本次费用 ¥${(selectedTaskPrice.value / 100).toFixed(2)}。确认继续吗？`, '确认创建直播任务', { confirmButtonText: '确认创建', cancelButtonText: '返回修改', type: 'warning' }).catch(() => false)
+  const accountCount = form.account_source === 'customer' ? form.account_ids.length : platformTaskAccountCount.value
+  const confirmed = await ElMessageBox.confirm(`将使用${modeName}（${accountCount} 个）执行${orderModeName}。确认创建任务吗？`, '确认创建直播任务', { confirmButtonText: '确认创建', cancelButtonText: '返回修改', type: 'warning' }).catch(() => false)
   if (!confirmed) return
   createTaskLoading.value = true
   try {
@@ -733,6 +774,39 @@ async function createCustomerTask() {
     if (!response.ok) { notify((await response.json()).detail || '创建任务失败', 'error'); return }
     createTaskVisible.value = false; notify('直播任务创建成功', 'success'); customerActive.value = 'tasks'; await loadCustomer()
   } finally { createTaskLoading.value = false }
+}
+async function requestPlanUpgrade(plan: any) {
+  if (plan.tier_level <= (currentPlan.value?.tier_level || 0)) return
+  const confirmed = await ElMessageBox.confirm(`申请升级到${plan.name}？平台确认价格后将为您开通。`, '升级套餐', { confirmButtonText: '提交申请', cancelButtonText: '取消', type: 'info' }).catch(() => false)
+  if (!confirmed) return
+  purchaseSubmitting.value = true
+  try {
+    const response = await fetch('/api/customer/purchase-orders', { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ order_type: 'plan_upgrade', plan_id: plan.id }) })
+    if (!response.ok) { notify((await response.json()).detail || '提交升级申请失败', 'error'); return }
+    notify('套餐升级申请已提交', 'success'); await loadCustomer()
+  } finally { purchaseSubmitting.value = false }
+}
+async function requestAccountQuota() {
+  purchaseSubmitting.value = true
+  try {
+    const response = await fetch('/api/customer/purchase-orders', { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ order_type: 'account_quota', quota_quantity: quotaPurchaseQuantity.value }) })
+    if (!response.ok) { notify((await response.json()).detail || '提交额度购买申请失败', 'error'); return }
+    quotaPurchaseVisible.value = false; notify('额外账号额度申请已提交', 'success'); await loadCustomer()
+  } finally { purchaseSubmitting.value = false }
+}
+async function reviewPurchaseOrder(order: any, action: 'approve' | 'reject') {
+  let note = ''
+  if (action === 'reject') {
+    const result: any = await ElMessageBox.prompt('请输入拒绝原因', '拒绝购买申请', { inputType: 'textarea', inputValidator: value => !!value.trim() || '请输入拒绝原因' }).catch(() => null)
+    if (!result) return
+    note = result.value.trim()
+  } else {
+    const confirmed = await ElMessageBox.confirm('确认该申请已完成费用核对，并立即开通对应权益吗？', '通过购买申请', { type: 'warning' }).catch(() => false)
+    if (!confirmed) return
+  }
+  const response = await fetch(`/api/admin/purchase-orders/${order.id}/review`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ action, note }) })
+  if (!response.ok) { notify((await response.json()).detail || '处理申请失败', 'error'); return }
+  notify(action === 'approve' ? '权益已开通' : '申请已拒绝', 'success'); await load()
 }
 async function addCustomerAccount() {
   if (!newCustomerAccountName.value.trim()) { notify('请输入账号名称', 'warning'); return }
@@ -834,6 +908,7 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
           <el-menu-item index="server"><el-icon><Monitor /></el-icon><span>服务器监控</span></el-menu-item>
           <el-menu-item index="settings"><el-icon><Setting /></el-icon><span>平台配置</span></el-menu-item>
           <el-menu-item index="customers"><el-icon><UserFilled /></el-icon><span>客户管理</span></el-menu-item>
+          <el-menu-item index="orders"><el-icon><Tickets /></el-icon><span>购买申请</span></el-menu-item>
           <el-menu-item index="accounts"><el-icon><Avatar /></el-icon><span>抖音账号</span></el-menu-item>
           <el-menu-item index="scripts"><el-icon><ChatDotRound /></el-icon><span>话术审核</span></el-menu-item>
           <el-menu-item index="tasks"><el-icon><Operation /></el-icon><span>直播任务</span></el-menu-item>
@@ -866,9 +941,34 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
         <template v-else-if="active === 'settings'">
           <div class="monitor-heading"><div><h1>平台配置</h1><p>保存后立即作用于新建任务、话术导入、扫码会话和 Worker 监控</p></div><el-button type="primary" :loading="platformSettingsLoading" @click="savePlatformSettings">保存配置</el-button></div>
           <el-card shadow="never" class="settings-card">
-            <div class="settings-section"><div class="settings-title"><strong>任务分配与计价</strong><span>配置平台账号数量、客户自有账号额度和两种任务价格</span></div><div class="settings-grid"><el-form-item label="平台模式每任务账号数"><el-input-number v-model="platformSettings.default_target_account_count" :min="1" :max="100" /></el-form-item><el-form-item label="客户默认自有账号额度"><el-input-number v-model="platformSettings.default_customer_account_quota" :min="0" :max="100" /></el-form-item><el-form-item label="自有账号模式价格（分/任务）"><el-input-number v-model="platformSettings.customer_account_task_price_cents" :min="0" :max="100000000" /></el-form-item><el-form-item label="平台账号模式价格（分/任务）"><el-input-number v-model="platformSettings.platform_account_task_price_cents" :min="0" :max="100000000" /></el-form-item><el-form-item label="单客户活动任务上限"><el-input-number v-model="platformSettings.max_active_tasks_per_customer" :min="1" :max="20" /></el-form-item><el-form-item label="单任务最多话术数"><el-input-number v-model="platformSettings.max_scripts_per_task" :min="1" :max="500" /></el-form-item><el-form-item label="单次话术导入上限"><el-input-number v-model="platformSettings.script_bulk_import_limit" :min="1" :max="1000" /></el-form-item></div></div>
+            <div class="settings-section"><div class="settings-title"><strong>话术管理</strong><span>套餐权益负责账号数量和任务额度，这里只设置平台级导入限制</span></div><div class="settings-grid"><el-form-item label="单次话术导入上限"><el-input-number v-model="platformSettings.script_bulk_import_limit" :min="1" :max="1000" /></el-form-item></div></div>
             <div class="settings-section"><div class="settings-title"><strong>评论间隔</strong><span>客户创建任务时只能在此范围内设置评论间隔</span></div><div class="settings-grid"><el-form-item label="允许的最小间隔（秒）"><el-input-number v-model="platformSettings.comment_min_interval_seconds" :min="5" :max="3600" /></el-form-item><el-form-item label="允许的最大间隔（秒）"><el-input-number v-model="platformSettings.comment_max_interval_seconds" :min="5" :max="3600" /></el-form-item></div></div>
             <div class="settings-section"><div class="settings-title"><strong>登录与 Worker</strong><span>控制二维码有效时间以及异常执行账号的判定和回收</span></div><div class="settings-grid"><el-form-item label="登录二维码有效时间（分钟）"><el-input-number v-model="platformSettings.qr_expire_minutes" :min="1" :max="30" /></el-form-item><el-form-item label="Worker 心跳超时（秒）"><el-input-number v-model="platformSettings.worker_heartbeat_timeout_seconds" :min="10" :max="300" /></el-form-item><el-form-item label="异常账号回收时间（秒）"><el-input-number v-model="platformSettings.account_reclaim_seconds" :min="30" :max="1800" /></el-form-item></div></div>
+            <div class="settings-section plan-settings-section"><div class="settings-title"><strong>套餐与收费</strong><span>套餐价格按30天周期设置，任务创建本身不产生单次费用</span></div><div class="admin-plan-list"><section v-for="plan in subscriptionPlans" :key="plan.id" class="admin-plan-card"><div class="mobile-card-title"><strong>{{ plan.name }}</strong><el-switch v-model="plan.enabled" active-text="上架" inactive-text="下架" /></div><div class="settings-grid"><el-form-item label="套餐价格（分/30天）"><el-input-number v-model="plan.price_cents" :min="0" :max="100000000" /></el-form-item><el-form-item label="额外账号单价（分/个）"><el-input-number v-model="plan.extra_account_price_cents" :min="0" :max="100000000" /></el-form-item><el-form-item label="自有账号基础额度"><el-input-number v-model="plan.base_douyin_account_quota" :min="0" :max="1000" /></el-form-item><el-form-item label="平台账号分配数量"><el-input-number v-model="plan.platform_account_count" :min="1" :max="100" /></el-form-item><el-form-item label="同时活动任务数"><el-input-number v-model="plan.max_active_tasks" :min="1" :max="20" /></el-form-item><el-form-item label="单任务话术上限"><el-input-number v-model="plan.max_scripts_per_task" :min="1" :max="500" /></el-form-item></div><el-button type="primary" :loading="planSavingId === plan.id" @click="saveSubscriptionPlan(plan)">保存{{ plan.name }}</el-button></section></div></div>
+          </el-card>
+        </template>
+
+        <template v-else-if="active === 'orders'">
+          <el-card shadow="never" style="margin-bottom: 12px">
+            <div class="query-title">查询条件</div>
+            <el-form inline label-position="right" class="queryForm">
+              <el-form-item label="订单"><el-input v-model="purchaseOrderKeyword" clearable placeholder="订单号 / 客户名称" :prefix-icon="Search" /></el-form-item>
+              <el-form-item label="状态"><el-select v-model="purchaseOrderStatus" clearable placeholder="请选择"><el-option label="处理中" value="pending" /><el-option label="已开通" value="approved" /><el-option label="已拒绝" value="rejected" /></el-select></el-form-item>
+              <el-form-item><el-button type="primary" @click="load">搜索</el-button><el-button @click="purchaseOrderKeyword = ''; purchaseOrderStatus = ''">重置</el-button></el-form-item>
+            </el-form>
+          </el-card>
+          <el-card shadow="never">
+            <div class="table-toolbar"><div class="table-title">购买申请列表</div><div class="record-total">共 {{ filteredPurchaseOrders.length }} 条记录</div></div>
+            <el-table v-loading="loading" :data="filteredPurchaseOrders" border stripe style="width:100%" empty-text="暂无购买申请">
+              <el-table-column type="index" label="序号" width="70" />
+              <el-table-column prop="order_no" label="订单号" min-width="190" />
+              <el-table-column label="客户" min-width="150"><template #default="{ row }">{{ customerName(row.customer_id) }}</template></el-table-column>
+              <el-table-column label="申请内容" min-width="190"><template #default="{ row }">{{ row.order_type === 'plan_upgrade' ? `升级至${planName(row.plan_id)}` : `增加 ${row.quota_quantity} 个账号额度` }}</template></el-table-column>
+              <el-table-column label="金额" width="130"><template #default="{ row }">{{ row.amount_cents == null ? '待确认' : `¥${(row.amount_cents / 100).toFixed(2)}` }}</template></el-table-column>
+              <el-table-column label="状态" width="110"><template #default="{ row }"><el-tag :type="row.status === 'approved' ? 'success' : row.status === 'rejected' ? 'danger' : 'warning'">{{ row.status === 'approved' ? '已开通' : row.status === 'rejected' ? '已拒绝' : '处理中' }}</el-tag></template></el-table-column>
+              <el-table-column label="提交时间" width="180"><template #default="{ row }">{{ formatDate(row.created_at) }}</template></el-table-column>
+              <el-table-column label="操作" width="150" fixed="right"><template #default="{ row }"><template v-if="row.status === 'pending'"><el-button link type="success" @click="reviewPurchaseOrder(row, 'approve')">通过</el-button><el-button link type="danger" @click="reviewPurchaseOrder(row, 'reject')">拒绝</el-button></template><span v-else class="cell-secondary">已处理</span></template></el-table-column>
+            </el-table>
           </el-card>
         </template>
 
@@ -908,7 +1008,7 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
           </el-card>
           <el-card shadow="never">
             <div class="table-toolbar"><div class="table-title">任务列表</div><div class="record-total">共 {{ filteredTasks.length }} 条记录</div></div>
-            <el-table v-loading="loading" :data="paginatedTasks" border stripe style="width: 100%" empty-text="暂无数据"><el-table-column type="index" label="序号" width="70" fixed="left" :index="taskTableIndex" /><el-table-column label="所属客户" min-width="140"><template #default="{ row }">{{ customerName(row.customer_id) }}</template></el-table-column><el-table-column prop="room_id" label="直播间 ID" min-width="180" /><el-table-column label="账号模式" width="120"><template #default="{ row }">{{ row.account_source === 'customer' ? '客户自有' : '平台账号' }}</template></el-table-column><el-table-column label="费用" width="100"><template #default="{ row }">¥{{ (row.billing_amount_cents / 100).toFixed(2) }}</template></el-table-column><el-table-column label="评论模式" width="110"><template #default="{ row }">{{ row.script_order_mode === 'sequential' ? '顺序评论' : '随机评论' }}</template></el-table-column><el-table-column label="任务状态" width="120"><template #default="{ row }"><el-tag :type="taskStatusMeta(row.status)[1]">{{ taskStatusMeta(row.status)[0] }}</el-tag></template></el-table-column><el-table-column prop="target_account_count" label="账号数量" width="110" /><el-table-column label="评论间隔" width="150"><template #default="{ row }">{{ row.min_interval_seconds }}–{{ row.max_interval_seconds }} 秒</template></el-table-column><el-table-column prop="failure_reason" label="异常原因" min-width="190" show-overflow-tooltip><template #default="{ row }">{{ row.failure_reason || '—' }}</template></el-table-column><el-table-column label="创建时间" min-width="180"><template #default="{ row }">{{ formatDate(row.created_at) }}</template></el-table-column><el-table-column label="操作" width="230" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="openTaskDetail(row)">详情</el-button><el-button v-if="['pending', 'running'].includes(row.status)" link type="warning" @click="changeAdminTask(row, 'pause')">暂停</el-button><el-button v-if="row.status === 'paused'" link type="success" @click="changeAdminTask(row, 'resume')">继续</el-button><el-button v-if="['pending', 'running', 'paused'].includes(row.status)" link type="danger" @click="changeAdminTask(row, 'stop')">停止</el-button></template></el-table-column></el-table>
+            <el-table v-loading="loading" :data="paginatedTasks" border stripe style="width: 100%" empty-text="暂无数据"><el-table-column type="index" label="序号" width="70" fixed="left" :index="taskTableIndex" /><el-table-column label="所属客户" min-width="140"><template #default="{ row }">{{ customerName(row.customer_id) }}</template></el-table-column><el-table-column prop="room_id" label="直播间 ID" min-width="180" /><el-table-column label="账号模式" width="120"><template #default="{ row }">{{ row.account_source === 'customer' ? '客户自有' : '平台账号' }}</template></el-table-column><el-table-column label="评论模式" width="110"><template #default="{ row }">{{ row.script_order_mode === 'sequential' ? '顺序评论' : '随机评论' }}</template></el-table-column><el-table-column label="任务状态" width="120"><template #default="{ row }"><el-tag :type="taskStatusMeta(row.status)[1]">{{ taskStatusMeta(row.status)[0] }}</el-tag></template></el-table-column><el-table-column prop="target_account_count" label="账号数量" width="110" /><el-table-column label="评论间隔" width="150"><template #default="{ row }">{{ row.min_interval_seconds }}–{{ row.max_interval_seconds }} 秒</template></el-table-column><el-table-column prop="failure_reason" label="异常原因" min-width="190" show-overflow-tooltip><template #default="{ row }">{{ row.failure_reason || '—' }}</template></el-table-column><el-table-column label="创建时间" min-width="180"><template #default="{ row }">{{ formatDate(row.created_at) }}</template></el-table-column><el-table-column label="操作" width="230" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="openTaskDetail(row)">详情</el-button><el-button v-if="['pending', 'running'].includes(row.status)" link type="warning" @click="changeAdminTask(row, 'pause')">暂停</el-button><el-button v-if="row.status === 'paused'" link type="success" @click="changeAdminTask(row, 'resume')">继续</el-button><el-button v-if="['pending', 'running', 'paused'].includes(row.status)" link type="danger" @click="changeAdminTask(row, 'stop')">停止</el-button></template></el-table-column></el-table>
             <div class="pagination-row"><el-pagination background layout="total, sizes, prev, pager, next, jumper" :total="filteredTasks.length" v-model:current-page="taskPage" v-model:page-size="taskPageSize" :page-sizes="[10, 20, 50, 100]" /></div>
           </el-card>
         </template>
@@ -940,7 +1040,7 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
               <el-table-column type="index" label="序号" width="70" fixed="left" :index="customerTableIndex" /><el-table-column prop="login" label="登录名" min-width="150" /><el-table-column prop="display_name" label="客户名称" min-width="160" />
               <el-table-column label="状态" width="100"><template #default="{ row }"><el-tag :type="row.status === 'active' && !customerExpired(row) ? 'success' : 'info'">{{ row.status === 'active' && !customerExpired(row) ? '正常' : '禁用' }}</el-tag></template></el-table-column>
               <el-table-column label="有效期" width="180"><template #default="{ row }"><div>{{ formatDate(row.expires_at) }}</div><div class="cell-secondary">{{ customerValidity(row) }}</div></template></el-table-column>
-              <el-table-column label="自有账号额度" width="130"><template #default="{ row }">{{ platformSettings.default_customer_account_quota + (row.extra_douyin_account_quota || 0) }} 个</template></el-table-column>
+              <el-table-column label="套餐" width="110"><template #default="{ row }">{{ planName(row.subscription_plan_id) }}</template></el-table-column><el-table-column label="自有账号额度" width="130"><template #default="{ row }">{{ customerPlanQuota(row) }} 个</template></el-table-column>
               <el-table-column label="最后登录" width="180"><template #default="{ row }">{{ formatDate(row.last_login_at) }}</template></el-table-column>
               <el-table-column label="创建时间" width="180"><template #default="{ row }">{{ formatDate(row.created_at) }}</template></el-table-column>
               <el-table-column label="操作" width="430" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="viewCustomerTasks(row)">查看任务</el-button><el-button link type="primary" @click="openEditCustomer(row)">编辑</el-button><el-button link type="primary" @click="openResetPassword(row)">重置密码</el-button><el-button v-if="customerExpired(row)" link type="success" @click="changeCustomerTerm(row, 'activate')">激活30天</el-button><el-button v-else link type="success" @click="changeCustomerTerm(row, 'renew')">续签30天</el-button><el-button v-if="row.status === 'active' && !customerExpired(row)" link type="warning" @click="toggleCustomer(row)">禁用</el-button><el-button v-else-if="!customerExpired(row)" link type="success" @click="toggleCustomer(row)">启用</el-button><el-button link type="danger" @click="deleteCustomer(row)">删除</el-button></template></el-table-column>
@@ -1020,8 +1120,8 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
       </template>
 
       <template v-else-if="customerActive === 'tasks'">
-        <div class="mobile-page-title"><div><h2>直播任务</h2><p>同时最多运行 {{ platformSettings.max_active_tasks_per_customer }} 个任务</p></div><el-button type="primary" :disabled="activeCustomerTaskCount >= platformSettings.max_active_tasks_per_customer" @click="openCreateTask">新建任务</el-button></div>
-        <section v-for="task in customerTasks" :key="task.id" class="mobile-card task-card"><div class="mobile-card-title"><strong>直播间 {{ task.room_id }}</strong><el-tag :type="taskStatusMeta(task.status)[1]">{{ taskStatusMeta(task.status)[0] }}</el-tag></div><div class="task-details"><span>账号模式：{{ task.account_source === 'customer' ? '我的账号' : '平台账号' }}</span><span>执行账号 {{ task.target_account_count }} 个 · 费用 ¥{{ (task.billing_amount_cents / 100).toFixed(2) }}</span><span>评论模式：{{ task.script_order_mode === 'sequential' ? '顺序评论' : '随机评论' }}</span><span>评论间隔 {{ task.min_interval_seconds }}–{{ task.max_interval_seconds }} 秒</span><span>{{ formatDate(task.created_at) }}</span></div><div class="task-actions"><el-button v-if="['pending', 'running'].includes(task.status)" size="small" @click="changeCustomerTask(task, 'pause')">暂停</el-button><el-button v-if="task.status === 'paused'" size="small" type="primary" @click="changeCustomerTask(task, 'resume')">继续</el-button><el-button v-if="['pending', 'running', 'paused'].includes(task.status)" size="small" type="danger" plain @click="changeCustomerTask(task, 'stop')">停止</el-button><el-button size="small" @click="showTaskLogs(task)">查看日志</el-button></div></section>
+        <div class="mobile-page-title"><div><h2>直播任务</h2><p>{{ currentPlan?.name || '标准版' }}同时最多运行 {{ activeTaskLimit }} 个任务</p></div><el-button type="primary" :disabled="activeCustomerTaskCount >= activeTaskLimit" @click="openCreateTask">新建任务</el-button></div>
+        <section v-for="task in customerTasks" :key="task.id" class="mobile-card task-card"><div class="mobile-card-title"><strong>直播间 {{ task.room_id }}</strong><el-tag :type="taskStatusMeta(task.status)[1]">{{ taskStatusMeta(task.status)[0] }}</el-tag></div><div class="task-details"><span>账号模式：{{ task.account_source === 'customer' ? '我的账号' : '平台账号' }}</span><span>执行账号 {{ task.target_account_count }} 个</span><span>评论模式：{{ task.script_order_mode === 'sequential' ? '顺序评论' : '随机评论' }}</span><span>评论间隔 {{ task.min_interval_seconds }}–{{ task.max_interval_seconds }} 秒</span><span>{{ formatDate(task.created_at) }}</span></div><div class="task-actions"><el-button v-if="['pending', 'running'].includes(task.status)" size="small" @click="changeCustomerTask(task, 'pause')">暂停</el-button><el-button v-if="task.status === 'paused'" size="small" type="primary" @click="changeCustomerTask(task, 'resume')">继续</el-button><el-button v-if="['pending', 'running', 'paused'].includes(task.status)" size="small" type="danger" plain @click="changeCustomerTask(task, 'stop')">停止</el-button><el-button size="small" @click="showTaskLogs(task)">查看日志</el-button></div></section>
         <el-empty v-if="!customerTasks.length" description="还没有直播任务" />
       </template>
 
@@ -1033,8 +1133,22 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
       </template>
 
       <template v-else>
-        <div class="mobile-page-title"><div><h2>我的账户</h2><p>查看服务期限和账户信息</p></div></div>
-        <section class="mobile-card profile-list"><div><span>客户名称</span><b>{{ customerMe?.display_name }}</b></div><div><span>登录账号</span><b>{{ customerMe?.login }}</b></div><div><span>账户状态</span><el-tag type="success">正常</el-tag></div><div><span>到期时间</span><b>{{ formatDate(customerMe?.expires_at) }}</b></div><div><span>可用倒计时</span><b class="countdown-text">{{ customerRemainingText }}</b></div></section>
+        <div class="mobile-page-title"><div><h2>个人中心</h2><p>管理套餐、账号额度和安全设置</p></div></div>
+        <section class="mobile-card subscription-current">
+          <div><span>当前套餐</span><strong>{{ currentPlan?.name || '标准版' }}</strong><small>有效期至 {{ formatDate(customerMe?.expires_at) }}</small></div>
+          <el-tag type="success">剩余 {{ customerRemainingText }}</el-tag>
+        </section>
+        <div class="plan-grid">
+          <section v-for="plan in subscriptionPlans" :key="plan.id" class="mobile-card plan-card" :class="{ current: plan.id === currentPlan?.id }">
+            <div class="mobile-card-title"><strong>{{ plan.name }}</strong><el-tag v-if="plan.id === currentPlan?.id" type="success">当前套餐</el-tag></div>
+            <ul><li>自有抖音账号 {{ plan.base_douyin_account_quota }} 个</li><li>平台任务分配 {{ plan.platform_account_count }} 个账号</li><li>同时运行 {{ plan.max_active_tasks }} 个任务</li><li>单任务最多 {{ plan.max_scripts_per_task }} 条话术</li><li>套餐周期 {{ plan.duration_days }} 天</li></ul>
+            <div class="plan-price">{{ plan.price_cents == null ? '价格由平台确认' : `¥${(plan.price_cents / 100).toFixed(2)} / 期` }}</div>
+            <el-button v-if="plan.tier_level > (currentPlan?.tier_level || 0)" type="primary" plain :loading="purchaseSubmitting" @click="requestPlanUpgrade(plan)">申请升级</el-button>
+          </section>
+        </div>
+        <section class="mobile-card quota-purchase-card"><div><strong>额外抖音账号额度</strong><span>当前额外额度 {{ customerAccountQuota.extra_quota }} 个，总额度 {{ customerAccountQuota.total_quota }} 个</span></div><el-button type="primary" @click="quotaPurchaseVisible = true">购买额度</el-button></section>
+        <section v-if="customerPurchaseOrders.length" class="mobile-card"><div class="mobile-card-title"><strong>我的购买申请</strong></div><div v-for="order in customerPurchaseOrders" :key="order.id" class="purchase-order-row"><span>{{ order.order_type === 'plan_upgrade' ? `升级至${planName(order.plan_id)}` : `增加 ${order.quota_quantity} 个账号额度` }}</span><el-tag :type="order.status === 'approved' ? 'success' : order.status === 'rejected' ? 'danger' : 'warning'">{{ order.status === 'approved' ? '已开通' : order.status === 'rejected' ? '已拒绝' : '处理中' }}</el-tag></div></section>
+        <section class="mobile-card profile-list"><div><span>客户名称</span><b>{{ customerMe?.display_name }}</b></div><div><span>登录账号</span><b>{{ customerMe?.login }}</b></div><div><span>账户状态</span><el-tag type="success">正常</el-tag></div></section>
         <el-button class="mobile-full-button" @click="profileVisible = true">修改密码</el-button><el-button class="mobile-full-button" type="danger" plain @click="logout">退出登录</el-button>
       </template>
     </main>
@@ -1046,11 +1160,11 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
       <el-form label-position="top">
         <el-form-item label="账号模式">
           <el-radio-group v-model="taskForm.account_source" class="mode-options" @change="taskForm.account_ids = []">
-            <el-radio-button value="customer">我的账号 · ¥{{ (platformSettings.customer_account_task_price_cents / 100).toFixed(2) }}</el-radio-button>
-            <el-radio-button value="platform">平台账号 · ¥{{ (platformSettings.platform_account_task_price_cents / 100).toFixed(2) }}</el-radio-button>
+            <el-radio-button value="customer">使用我的账号</el-radio-button>
+            <el-radio-button value="platform">使用平台账号</el-radio-button>
           </el-radio-group>
         </el-form-item>
-        <el-alert v-if="taskForm.account_source === 'platform'" :title="`平台将随机分配 ${platformSettings.default_target_account_count} 个闲置账号`" type="info" :closable="false" />
+        <el-alert v-if="taskForm.account_source === 'platform'" :title="`当前${currentPlan?.name || '套餐'}将分配 ${platformTaskAccountCount} 个平台账号`" type="info" :closable="false" />
         <template v-else>
           <el-form-item label="选择我的可用账号">
             <el-checkbox-group v-model="taskForm.account_ids" class="script-options">
@@ -1063,7 +1177,7 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
         <el-form-item>
           <template #label>
             <div class="script-select-heading">
-              <span>选择审核通过的话术（最多 {{ platformSettings.max_scripts_per_task }} 条）</span>
+              <span>选择审核通过的话术（当前套餐最多 {{ taskScriptLimit }} 条）</span>
               <el-button link type="primary" @click="toggleAllTaskScripts">{{ allTaskScriptsSelected ? '取消全选' : '全选' }}</el-button>
             </div>
           </template>
@@ -1071,7 +1185,7 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
             <el-checkbox v-for="script in selectableTaskScripts" :key="script.id" :value="script.id"><span>{{ script.content }}</span></el-checkbox>
           </el-checkbox-group>
           <div class="selection-summary">已选择 {{ taskForm.script_ids.length }} 条</div>
-          <el-alert v-if="approvedCustomerScripts.length > platformSettings.max_scripts_per_task" :title="`审核通过的话术较多，本次可选择前 ${platformSettings.max_scripts_per_task} 条`" type="warning" :closable="false" show-icon />
+          <el-alert v-if="approvedCustomerScripts.length > taskScriptLimit" :title="`审核通过的话术较多，本次可选择前 ${taskScriptLimit} 条`" type="warning" :closable="false" show-icon />
         </el-form-item>
         <el-form-item label="评论模式">
           <el-radio-group v-model="taskForm.script_order_mode" class="mode-options">
@@ -1084,9 +1198,13 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
           <el-form-item label="最小间隔（秒）"><el-input-number v-model="taskForm.min_interval_seconds" :min="platformSettings.comment_min_interval_seconds" :max="platformSettings.comment_max_interval_seconds" /></el-form-item>
           <el-form-item label="最大间隔（秒）"><el-input-number v-model="taskForm.max_interval_seconds" :min="platformSettings.comment_min_interval_seconds" :max="platformSettings.comment_max_interval_seconds" /></el-form-item>
         </div>
-        <div class="price-summary"><span>本次任务费用</span><strong>¥{{ (selectedTaskPrice / 100).toFixed(2) }}</strong></div>
       </el-form>
       <template #footer><el-button @click="createTaskVisible = false">取消</el-button><el-button type="primary" :loading="createTaskLoading" @click="createCustomerTask">创建任务</el-button></template>
+    </el-dialog>
+    <el-dialog v-model="quotaPurchaseVisible" title="购买额外账号额度" width="min(92vw, 420px)" align-center>
+      <el-form label-position="top"><el-form-item label="购买数量"><el-input-number v-model="quotaPurchaseQuantity" :min="1" :max="100" /></el-form-item></el-form>
+      <el-alert title="提交后由管理员确认价格并开通额度" type="info" :closable="false" />
+      <template #footer><el-button @click="quotaPurchaseVisible = false">取消</el-button><el-button type="primary" :loading="purchaseSubmitting" @click="requestAccountQuota">提交购买申请</el-button></template>
     </el-dialog>
     <el-dialog v-model="addCustomerAccountVisible" title="添加我的抖音号" width="min(92vw, 420px)" align-center><el-form label-position="top"><el-form-item label="账号备注名称"><el-input v-model="newCustomerAccountName" maxlength="100" placeholder="例如：直播账号 1" @keyup.enter="addCustomerAccount" /></el-form-item></el-form><template #footer><el-button @click="addCustomerAccountVisible = false">取消</el-button><el-button type="primary" :loading="addCustomerAccountLoading" @click="addCustomerAccount">添加</el-button></template></el-dialog>
     <el-dialog v-model="logVisible" title="评论日志" width="min(94vw, 760px)" align-center><el-table :data="customerLogs" border stripe max-height="460" empty-text="暂无评论日志"><el-table-column type="index" label="序号" width="70" /><el-table-column label="时间" width="170"><template #default="{ row }">{{ formatDate(row.sent_at || row.created_at) }}</template></el-table-column><el-table-column prop="content" label="评论内容" min-width="240" show-overflow-tooltip /><el-table-column prop="result" label="结果" width="120" /><el-table-column prop="sensitive_word" label="敏感词" width="120"><template #default="{ row }">{{ row.sensitive_word || '—' }}</template></el-table-column></el-table></el-dialog>
@@ -1103,7 +1221,7 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
 .monitor-heading{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}.monitor-heading h1{margin:0;color:#202938;font-size:22px}.monitor-heading p{margin:5px 0 0;color:#9098a7;font-size:12px}.metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:14px}.metric-card{border-color:#e6eaf1}.metric-card :deep(.el-card__body){padding:19px}.metric-label{color:#778195;font-size:13px}.metric-value{margin:10px 0 12px;color:#26334d;font-size:29px;font-weight:700;line-height:1.2}.metric-value small{margin-left:2px;font-size:15px}.uptime-value{min-height:35px;display:flex;align-items:center;font-size:17px}.metric-note{margin-top:11px;color:#959dac;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.service-card{margin-bottom:14px;border-color:#e6eaf1}.service-card :deep(.el-card__body),.server-info-card :deep(.el-card__body){padding:18px}.live-indicator{display:flex;align-items:center;gap:7px;color:#67c23a;font-size:12px}.live-indicator i{width:8px;height:8px;border-radius:50%;background:#67c23a;box-shadow:0 0 0 4px rgba(103,194,58,.13)}.server-info-card{border-color:#e6eaf1}.server-info-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-top:16px}.server-info-grid div{min-width:0;padding:13px;border-radius:8px;background:#f7f9fc}.server-info-grid span,.server-info-grid b{display:block}.server-info-grid span{color:#9098a7;font-size:11px}.server-info-grid b{margin-top:6px;color:#39445a;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .settings-card{border-color:#e6eaf1}.settings-card :deep(.el-card__body){padding:0 24px}.settings-section{display:grid;grid-template-columns:240px 1fr;gap:34px;padding:26px 0;border-bottom:1px solid #edf0f5}.settings-section:last-child{border-bottom:0}.settings-title strong,.settings-title span{display:block}.settings-title strong{color:#26334d;font-size:15px}.settings-title span{margin-top:7px;color:#9098a7;font-size:12px;line-height:1.6}.settings-grid{display:grid;grid-template-columns:repeat(2,minmax(230px,1fr));gap:4px 28px}.settings-grid .el-form-item{margin-bottom:18px}.settings-grid :deep(.el-form-item__label){color:#5e687a}.settings-grid .el-input-number{width:100%}
 .login-page{position:relative;min-height:100vh;overflow:hidden;color:rgba(255,255,255,.94);background:#050712}.login-bg{position:absolute;inset:0;background:radial-gradient(900px 600px at 15% 10%,rgba(0,255,204,.13),transparent 58%),radial-gradient(900px 600px at 85% 35%,rgba(111,84,233,.22),transparent 58%),linear-gradient(180deg,#0b1020,#050712 72%)}.login-grid{position:absolute;inset:0;opacity:.42;background-image:radial-gradient(rgba(255,255,255,.12) 1px,transparent 1px);background-size:24px 24px;mask-image:radial-gradient(circle at 55% 40%,#000,transparent 70%)}.login-orb{position:absolute;width:500px;height:500px;border-radius:50%;filter:blur(70px);opacity:.35}.orb-one{left:-240px;top:-220px;background:#00d9b0}.orb-two{right:-220px;top:80px;background:#7657e8}.login-topbar{position:relative;z-index:1;display:flex;align-items:center;justify-content:space-between;padding:22px 30px}.brand-on-dark{color:#fff}.brand-on-dark small{display:block;margin-top:2px;color:rgba(255,255,255,.55);font-size:11px}.security-badges{display:flex;gap:9px}.security-badges span{padding:7px 10px;color:rgba(255,255,255,.68);font-size:11px;border:1px solid rgba(255,255,255,.12);border-radius:999px;background:rgba(255,255,255,.05)}.login-content{position:relative;z-index:1;width:min(1120px,calc(100% - 48px));min-height:calc(100vh - 90px);display:grid;grid-template-columns:1.1fr .9fr;align-items:center;gap:70px;margin:0 auto;padding-bottom:70px}.login-intro h1{margin:20px 0 16px;font-size:clamp(38px,5vw,58px);line-height:1.12;letter-spacing:-1.5px}.login-intro>p{max-width:560px;margin:0;color:rgba(255,255,255,.63);font-size:16px;line-height:1.8}.login-features{display:flex;gap:14px;margin-top:28px}.login-features div{min-width:130px;padding:14px 16px;border:1px solid rgba(255,255,255,.12);border-radius:14px;background:rgba(255,255,255,.06);backdrop-filter:blur(10px)}.login-features strong,.login-features span{display:block}.login-features strong{font-size:17px}.login-features span{margin-top:4px;color:rgba(255,255,255,.55);font-size:12px}.login-card-wrap{position:relative}.login-card-glow{position:absolute;inset:-18px;border-radius:28px;background:radial-gradient(circle at 20% 0,rgba(0,255,204,.22),transparent 48%),radial-gradient(circle at 90% 30%,rgba(118,87,232,.3),transparent 52%);filter:blur(12px)}.login-card{position:relative;border:1px solid rgba(255,255,255,.14);border-radius:20px;background:rgba(255,255,255,.07);backdrop-filter:blur(16px)}.login-card :deep(.el-card__body){padding:30px}.login-card-title{font-size:22px;font-weight:700}.login-card p{margin:7px 0 24px;color:rgba(255,255,255,.56);font-size:13px}.login-card :deep(.el-form-item__label){color:rgba(255,255,255,.72)}.login-card :deep(.el-input__wrapper){background:rgba(0,0,0,.23);box-shadow:0 0 0 1px rgba(255,255,255,.12) inset}.login-card :deep(.el-input__inner),.login-card :deep(.el-input__prefix),.login-card :deep(.el-input__suffix){color:rgba(255,255,255,.9)}.login-card .el-button{width:100%;margin-top:4px;border-radius:8px}
-.customer-app{min-height:100vh;color:#253047;background:#f3f6fb}.customer-header{position:sticky;top:0;z-index:20;height:68px;display:flex;align-items:center;justify-content:space-between;padding:0 max(18px,calc((100vw - 680px)/2));color:#fff;background:linear-gradient(135deg,#3978f6,#6458df);box-shadow:0 4px 18px rgba(57,120,246,.2)}.customer-header>div:first-child{display:flex;flex-direction:column;gap:3px}.customer-header strong{font-size:18px}.customer-header span{color:rgba(255,255,255,.76);font-size:12px}.expiry-chip{min-width:140px;padding:8px 12px;text-align:right;border:1px solid rgba(255,255,255,.22);border-radius:10px;background:rgba(255,255,255,.12)}.expiry-chip small,.expiry-chip b{display:block}.expiry-chip small{color:rgba(255,255,255,.7);font-size:10px}.expiry-chip b{margin-top:2px;font-size:13px}.customer-main{width:min(100%,680px);min-height:calc(100vh - 68px);margin:auto;padding:18px 14px 94px}.customer-hero{display:flex;flex-direction:column;gap:5px;margin-bottom:14px;padding:23px;color:#fff;border-radius:17px;background:linear-gradient(135deg,#263d80,#5566df);box-shadow:0 12px 26px rgba(58,79,166,.2)}.customer-hero span,.customer-hero small{color:rgba(255,255,255,.7)}.customer-hero strong{font-size:30px;letter-spacing:.5px}.customer-metrics{display:grid;grid-template-columns:repeat(3,1fr);margin-bottom:14px;padding:17px 8px;border:1px solid #edf0f5;border-radius:14px;background:#fff}.customer-metrics div{text-align:center;border-right:1px solid #edf0f5}.customer-metrics div:last-child{border-right:0}.customer-metrics span,.customer-metrics strong{display:block}.customer-metrics span{color:#8992a3;font-size:12px}.customer-metrics strong{margin-top:7px;color:#26334d;font-size:23px}.mobile-card{margin-bottom:13px;padding:16px;border:1px solid #e9edf4;border-radius:14px;background:#fff;box-shadow:0 4px 14px rgba(35,52,86,.04)}.mobile-card-title,.mobile-page-title{display:flex;align-items:center;justify-content:space-between;gap:14px}.mobile-card-title strong{min-width:0;color:#263047;font-size:15px}.active-task{display:flex;align-items:center;justify-content:space-between;margin-top:16px;padding:14px;border-radius:10px;background:#f6f8fc}.active-task div{display:flex;flex-direction:column;gap:5px}.active-task span{color:#9099a8;font-size:12px}.mobile-page-title{margin:5px 2px 16px}.mobile-page-title h2{margin:0;font-size:21px}.mobile-page-title p{margin:4px 0 0;color:#9099a8;font-size:12px}.script-card p{margin:14px 0;color:#47536a;line-height:1.7;white-space:pre-wrap;word-break:break-word}.script-footer{min-height:26px;display:flex;align-items:center;justify-content:space-between;gap:12px;color:#9099a8;font-size:12px}.task-details{display:flex;flex-direction:column;gap:8px;margin:14px 0;color:#768095;font-size:13px}.task-actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:7px;padding-top:12px;border-top:1px solid #edf0f5}.task-actions .el-button{margin-left:0}.profile-list>div{min-height:48px;display:flex;align-items:center;justify-content:space-between;gap:16px;border-bottom:1px solid #edf0f5}.profile-list>div:last-child{border-bottom:0}.profile-list span{color:#7d8799}.countdown-text{color:#4d67db}.mobile-full-button{width:100%;margin:0 0 12px!important}.customer-nav{position:fixed;left:0;right:0;bottom:0;z-index:30;height:72px;display:grid;grid-template-columns:repeat(6,1fr);padding:6px max(6px,calc((100vw - 680px)/2));border-top:1px solid #e6eaf1;background:rgba(255,255,255,.96);box-shadow:0 -6px 20px rgba(42,55,82,.07);backdrop-filter:blur(12px)}.customer-nav button{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;color:#8992a3;font:inherit;font-size:11px;border:0;background:transparent;cursor:pointer}.customer-nav button .el-icon{font-size:20px}.customer-nav button.active{color:#4568df;font-weight:600}.customer-nav .create-nav .el-icon{width:38px;height:34px;margin-top:-22px;color:#fff;font-size:25px;border-radius:12px;background:linear-gradient(135deg,#3978f6,#6458df);box-shadow:0 7px 16px rgba(69,104,223,.3)}.dialog-help{margin:-4px 0 12px;color:#7e8798;font-size:13px}.script-select-heading{width:100%;display:flex;align-items:center;justify-content:space-between;gap:12px}.selection-summary{margin-top:7px;color:#8a93a3;font-size:12px}.script-options{max-height:230px;display:flex;flex-direction:column;gap:4px;overflow:auto;border:1px solid #e3e7ee;border-radius:8px;padding:7px 10px}.script-options .el-checkbox{height:auto;min-height:34px;margin-right:0;padding:5px 0;white-space:normal}.script-options .el-checkbox span{line-height:1.5}.interval-row{display:grid;grid-template-columns:1fr 1fr;gap:14px}.interval-row .el-input-number{width:100%}.mode-options{display:flex;width:100%}.mode-options :deep(.el-radio-button){flex:1}.mode-options :deep(.el-radio-button__inner){width:100%}.price-summary{display:flex;align-items:center;justify-content:space-between;margin-top:16px;padding:14px 16px;border-radius:9px;background:#f4f7ff;color:#667085}.price-summary strong{color:#4568df;font-size:22px}.account-card{margin-top:13px}.readiness-card>.mobile-card-title{margin-bottom:8px}.readiness-card>.mobile-card-title span{color:#98a1b1;font-size:12px}.readiness-step{width:100%;display:flex;align-items:center;gap:12px;padding:13px 4px;color:inherit;text-align:left;border:0;border-bottom:1px solid #edf0f5;background:transparent;cursor:pointer}.readiness-step:last-child{border-bottom:0}.readiness-step i{width:28px;height:28px;display:grid;place-items:center;flex:none;color:#7d8799;font-style:normal;font-size:12px;border-radius:50%;background:#edf0f5}.readiness-step i.done{color:#fff;background:#67c23a}.readiness-step span{min-width:0;display:flex;flex:1;flex-direction:column;gap:4px}.readiness-step b{color:#354158;font-size:14px}.readiness-step small{color:#929bad;font-size:12px}.readiness-step em{color:#a5adba;font-size:23px;font-style:normal}
+.customer-app{min-height:100vh;color:#253047;background:#f3f6fb}.customer-header{position:sticky;top:0;z-index:20;height:68px;display:flex;align-items:center;justify-content:space-between;padding:0 max(18px,calc((100vw - 680px)/2));color:#fff;background:linear-gradient(135deg,#3978f6,#6458df);box-shadow:0 4px 18px rgba(57,120,246,.2)}.customer-header>div:first-child{display:flex;flex-direction:column;gap:3px}.customer-header strong{font-size:18px}.customer-header span{color:rgba(255,255,255,.76);font-size:12px}.expiry-chip{min-width:140px;padding:8px 12px;text-align:right;border:1px solid rgba(255,255,255,.22);border-radius:10px;background:rgba(255,255,255,.12)}.expiry-chip small,.expiry-chip b{display:block}.expiry-chip small{color:rgba(255,255,255,.7);font-size:10px}.expiry-chip b{margin-top:2px;font-size:13px}.customer-main{width:min(100%,680px);min-height:calc(100vh - 68px);margin:auto;padding:18px 14px 94px}.customer-hero{display:flex;flex-direction:column;gap:5px;margin-bottom:14px;padding:23px;color:#fff;border-radius:17px;background:linear-gradient(135deg,#263d80,#5566df);box-shadow:0 12px 26px rgba(58,79,166,.2)}.customer-hero span,.customer-hero small{color:rgba(255,255,255,.7)}.customer-hero strong{font-size:30px;letter-spacing:.5px}.customer-metrics{display:grid;grid-template-columns:repeat(3,1fr);margin-bottom:14px;padding:17px 8px;border:1px solid #edf0f5;border-radius:14px;background:#fff}.customer-metrics div{text-align:center;border-right:1px solid #edf0f5}.customer-metrics div:last-child{border-right:0}.customer-metrics span,.customer-metrics strong{display:block}.customer-metrics span{color:#8992a3;font-size:12px}.customer-metrics strong{margin-top:7px;color:#26334d;font-size:23px}.mobile-card{margin-bottom:13px;padding:16px;border:1px solid #e9edf4;border-radius:14px;background:#fff;box-shadow:0 4px 14px rgba(35,52,86,.04)}.mobile-card-title,.mobile-page-title{display:flex;align-items:center;justify-content:space-between;gap:14px}.mobile-card-title strong{min-width:0;color:#263047;font-size:15px}.active-task{display:flex;align-items:center;justify-content:space-between;margin-top:16px;padding:14px;border-radius:10px;background:#f6f8fc}.active-task div{display:flex;flex-direction:column;gap:5px}.active-task span{color:#9099a8;font-size:12px}.mobile-page-title{margin:5px 2px 16px}.mobile-page-title h2{margin:0;font-size:21px}.mobile-page-title p{margin:4px 0 0;color:#9099a8;font-size:12px}.script-card p{margin:14px 0;color:#47536a;line-height:1.7;white-space:pre-wrap;word-break:break-word}.script-footer{min-height:26px;display:flex;align-items:center;justify-content:space-between;gap:12px;color:#9099a8;font-size:12px}.task-details{display:flex;flex-direction:column;gap:8px;margin:14px 0;color:#768095;font-size:13px}.task-actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:7px;padding-top:12px;border-top:1px solid #edf0f5}.task-actions .el-button{margin-left:0}.profile-list>div{min-height:48px;display:flex;align-items:center;justify-content:space-between;gap:16px;border-bottom:1px solid #edf0f5}.profile-list>div:last-child{border-bottom:0}.profile-list span{color:#7d8799}.countdown-text{color:#4d67db}.mobile-full-button{width:100%;margin:0 0 12px!important}.customer-nav{position:fixed;left:0;right:0;bottom:0;z-index:30;height:72px;display:grid;grid-template-columns:repeat(6,1fr);padding:6px max(6px,calc((100vw - 680px)/2));border-top:1px solid #e6eaf1;background:rgba(255,255,255,.96);box-shadow:0 -6px 20px rgba(42,55,82,.07);backdrop-filter:blur(12px)}.customer-nav button{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;color:#8992a3;font:inherit;font-size:11px;border:0;background:transparent;cursor:pointer}.customer-nav button .el-icon{font-size:20px}.customer-nav button.active{color:#4568df;font-weight:600}.customer-nav .create-nav .el-icon{width:38px;height:34px;margin-top:-22px;color:#fff;font-size:25px;border-radius:12px;background:linear-gradient(135deg,#3978f6,#6458df);box-shadow:0 7px 16px rgba(69,104,223,.3)}.dialog-help{margin:-4px 0 12px;color:#7e8798;font-size:13px}.script-select-heading{width:100%;display:flex;align-items:center;justify-content:space-between;gap:12px}.selection-summary{margin-top:7px;color:#8a93a3;font-size:12px}.script-options{width:100%;box-sizing:border-box;max-height:230px;display:flex;flex-direction:column;gap:4px;overflow:auto;border:1px solid #e3e7ee;border-radius:8px;padding:7px 10px}.script-options .el-checkbox{height:auto;min-height:34px;margin-right:0;padding:5px 0;white-space:normal}.script-options .el-checkbox span{line-height:1.5}.interval-row{display:grid;grid-template-columns:1fr 1fr;gap:14px}.interval-row .el-input-number{width:100%}.mode-options{display:flex;width:100%}.mode-options :deep(.el-radio-button){flex:1}.mode-options :deep(.el-radio-button__inner){width:100%}.price-summary{display:flex;align-items:center;justify-content:space-between;margin-top:16px;padding:14px 16px;border-radius:9px;background:#f4f7ff;color:#667085}.price-summary strong{color:#4568df;font-size:22px}.plan-settings-section{grid-template-columns:240px 1fr}.admin-plan-list{display:grid;gap:14px}.admin-plan-card{padding:18px;border:1px solid #e5eaf2;border-radius:10px;background:#f9fbfe}.admin-plan-card .settings-grid{margin-top:16px}.admin-plan-card .el-input-number{width:100%}.subscription-current{display:flex;align-items:center;justify-content:space-between;gap:18px}.subscription-current>div{display:flex;flex-direction:column;gap:6px}.subscription-current span,.subscription-current small{color:#8a93a3}.subscription-current strong{font-size:24px;color:#34435f}.plan-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.plan-card{display:flex;flex-direction:column}.plan-card.current{border-color:#8aa6ff;box-shadow:0 8px 22px rgba(69,104,223,.12)}.plan-card ul{min-height:104px;margin:14px 0;padding-left:20px;color:#6f798b;font-size:13px;line-height:1.9}.plan-price{margin-top:auto;padding:10px 0 14px;color:#4568df;font-weight:600}.quota-purchase-card{display:flex;align-items:center;justify-content:space-between;gap:16px}.quota-purchase-card>div{display:flex;flex-direction:column;gap:6px}.quota-purchase-card span{color:#8a93a3;font-size:12px}.purchase-order-row{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 0;border-bottom:1px solid #edf0f5}.purchase-order-row:last-child{border-bottom:0}.account-card{margin-top:13px}.readiness-card>.mobile-card-title{margin-bottom:8px}.readiness-card>.mobile-card-title span{color:#98a1b1;font-size:12px}.readiness-step{width:100%;display:flex;align-items:center;gap:12px;padding:13px 4px;color:inherit;text-align:left;border:0;border-bottom:1px solid #edf0f5;background:transparent;cursor:pointer}.readiness-step:last-child{border-bottom:0}.readiness-step i{width:28px;height:28px;display:grid;place-items:center;flex:none;color:#7d8799;font-style:normal;font-size:12px;border-radius:50%;background:#edf0f5}.readiness-step i.done{color:#fff;background:#67c23a}.readiness-step span{min-width:0;display:flex;flex:1;flex-direction:column;gap:4px}.readiness-step b{color:#354158;font-size:14px}.readiness-step small{color:#929bad;font-size:12px}.readiness-step em{color:#a5adba;font-size:23px;font-style:normal}
 @media(min-width:901px){.customer-app{height:100vh;overflow:hidden}.customer-header{position:fixed;left:0;right:0;padding:0 24px;background:#fff;color:#273247;border-bottom:1px solid #e6eaf1;box-shadow:none}.customer-header strong{color:#26334d;font-size:18px}.customer-header span{color:#8b94a5}.expiry-chip{color:#4568df;border-color:#dfe5f5;background:#f5f7ff}.expiry-chip small{color:#8992a3}.customer-nav{top:68px;right:auto;bottom:0;width:220px;height:auto;display:flex;flex-direction:column;gap:5px;padding:16px 10px;border-top:0;border-right:1px solid #e6eaf1;box-shadow:none;background:#fff}.customer-nav button{height:46px;flex:none;flex-direction:row;justify-content:flex-start;gap:11px;padding:0 15px;color:#626d80;font-size:14px;border-radius:7px}.customer-nav button .el-icon{font-size:18px}.customer-nav button.active{color:#4568df;background:#eef3ff}.customer-nav .create-nav{order:5;margin-top:auto;color:#fff;background:linear-gradient(135deg,#3978f6,#6458df);box-shadow:0 7px 16px rgba(69,104,223,.18)}.customer-nav .create-nav .el-icon{width:auto;height:auto;margin:0;color:#fff;font-size:19px;border-radius:0;background:transparent;box-shadow:none}.customer-main{width:auto;height:calc(100vh - 68px);min-height:0;margin:68px 0 0 220px;padding:24px clamp(24px,4vw,54px);overflow:auto}.customer-hero{padding:28px 30px;border-radius:12px}.customer-metrics{padding:22px 8px;border-radius:10px}.mobile-card{padding:20px;border-radius:10px}.mobile-page-title{margin-bottom:20px}.mobile-page-title h2{font-size:22px}.profile-list{max-width:760px}.mobile-full-button{width:220px;margin-right:10px!important}}
-@media(max-width:1100px){.metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.server-info-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.settings-section{grid-template-columns:1fr;gap:18px}}@media(max-width:900px){.app-aside{width:76px!important}.app-aside :deep(.el-menu-item span),.aside-footer{display:none}.app-aside :deep(.el-menu-item){justify-content:center;padding:0!important}.app-aside :deep(.el-menu-item .el-icon){margin:0}.app-main{padding:16px}.login-content{grid-template-columns:1fr;max-width:480px;gap:36px;padding:40px 0 70px}.login-intro{display:none}}@media(max-width:600px){.app-header{padding:0 12px}.brand>strong,.brand>.el-tag,.profile-trigger>span{display:none}.app-aside{width:58px!important}.app-aside .el-menu{padding:10px 6px}.app-main{padding:12px 10px}.filter-form :deep(.el-form-item){display:flex;margin-right:0}.filter-form :deep(.el-input),.filter-form :deep(.el-select){width:100%}.security-badges{display:none}.login-topbar{padding:18px}.login-content{width:calc(100% - 28px)}.login-card :deep(.el-card__body){padding:22px}.metric-grid,.server-info-grid,.settings-grid{grid-template-columns:1fr}.monitor-heading{align-items:flex-start}.monitor-heading h1{font-size:19px}.settings-card :deep(.el-card__body){padding:0 16px}.customer-header{height:64px;padding:0 14px}.expiry-chip{min-width:128px;padding:7px 9px}.customer-main{padding:14px 11px 90px}.customer-hero{padding:19px}.customer-hero strong{font-size:25px}.mobile-card{padding:14px}.mobile-page-title h2{font-size:19px}.interval-row{grid-template-columns:1fr}.customer-nav{height:68px}}
+@media(max-width:1100px){.metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.server-info-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.settings-section{grid-template-columns:1fr;gap:18px}}@media(max-width:900px){.app-aside{width:76px!important}.app-aside :deep(.el-menu-item span),.aside-footer{display:none}.app-aside :deep(.el-menu-item){justify-content:center;padding:0!important}.app-aside :deep(.el-menu-item .el-icon){margin:0}.app-main{padding:16px}.login-content{grid-template-columns:1fr;max-width:480px;gap:36px;padding:40px 0 70px}.login-intro{display:none}}@media(max-width:600px){.plan-grid{grid-template-columns:1fr}.subscription-current,.quota-purchase-card{align-items:flex-start;flex-direction:column}.quota-purchase-card .el-button{width:100%}.app-header{padding:0 12px}.brand>strong,.brand>.el-tag,.profile-trigger>span{display:none}.app-aside{width:58px!important}.app-aside .el-menu{padding:10px 6px}.app-main{padding:12px 10px}.filter-form :deep(.el-form-item){display:flex;margin-right:0}.filter-form :deep(.el-input),.filter-form :deep(.el-select){width:100%}.security-badges{display:none}.login-topbar{padding:18px}.login-content{width:calc(100% - 28px)}.login-card :deep(.el-card__body){padding:22px}.metric-grid,.server-info-grid,.settings-grid{grid-template-columns:1fr}.monitor-heading{align-items:flex-start}.monitor-heading h1{font-size:19px}.settings-card :deep(.el-card__body){padding:0 16px}.customer-header{height:64px;padding:0 14px}.expiry-chip{min-width:128px;padding:7px 9px}.customer-main{padding:14px 11px 90px}.customer-hero{padding:19px}.customer-hero strong{font-size:25px}.mobile-card{padding:14px}.mobile-page-title h2{font-size:19px}.interval-row{grid-template-columns:1fr}.customer-nav{height:68px}}
 </style>

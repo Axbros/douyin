@@ -5,22 +5,15 @@ from app.models import SystemSetting
 
 
 DEFAULT_PLATFORM_SETTINGS = {
-    "default_target_account_count": 3,
-    "max_active_tasks_per_customer": 1,
     "comment_min_interval_seconds": 5,
     "comment_max_interval_seconds": 3600,
-    "max_scripts_per_task": 100,
     "script_bulk_import_limit": 200,
     "qr_expire_minutes": 5,
     "worker_heartbeat_timeout_seconds": 20,
     "account_reclaim_seconds": 60,
-    "default_customer_account_quota": 3,
-    "customer_account_task_price_cents": 1000,
-    "platform_account_task_price_cents": 3000,
 }
 
 SETTING_KEYS = {name: f"platform.{name}" for name in DEFAULT_PLATFORM_SETTINGS}
-SETTING_KEYS["default_target_account_count"] = "task.default_target_account_count"
 
 
 async def get_platform_settings(db: AsyncSession) -> dict[str, int]:
