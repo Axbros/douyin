@@ -103,6 +103,20 @@ class AdminScriptResponse(BaseModel):
     reviewed_at: datetime | None = None
 
 
+class ScriptBatchReviewRequest(BaseModel):
+    script_ids: list[int] = Field(min_length=1, max_length=500)
+    action: str = Field(pattern="^(approve|reject)$")
+    reason: str | None = Field(default=None, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_review(self):
+        if len(set(self.script_ids)) != len(self.script_ids):
+            raise ValueError("话术不能重复选择")
+        if self.action == "reject" and not (self.reason or "").strip():
+            raise ValueError("批量拒绝时必须填写原因")
+        return self
+
+
 class TaskCreate(BaseModel):
     room_id: str = Field(min_length=1, max_length=100)
     script_ids: list[int] = Field(min_length=1)

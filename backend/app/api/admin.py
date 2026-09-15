@@ -40,7 +40,7 @@ from app.schemas import (
     LoginVerificationMethodRequest,
     PlatformSettingsResponse,
     PlatformSettingsUpdate,
-    ScriptResponse,
+    ScriptResponse, ScriptBatchReviewRequest,
     ServerStatusResponse,
     ServiceStatus,
     SensitiveWordCreate,
@@ -888,6 +888,30 @@ async def _review(script_id: int, status: str, reason: str | None, user: User, d
 @router.post("/scripts/{script_id}/approve", response_model=ScriptResponse)
 async def approve_script(script_id: int, user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
     return await _review(script_id, "approved", None, user, db)
+
+
+@router.post("/scripts/batch-review", response_model=list[ScriptResponse])
+async def batch_review_scripts(
+    payload: ScriptBatchReviewRequest,
+    user: Annotated[User, Depends(admin_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    scripts = list(await db.scalars(select(Script).where(
+        Script.id.in_(payload.script_ids), Script.status == "pending_review",
+        Script.deleted_at.is_(None),
+    ).with_for_update()))
+    if len(scripts) != len(payload.script_ids):
+        raise HTTPException(409, "所选话术中存在已处理或不存在的数据，请刷新后重试")
+    status = "approved" if payload.action == "approve" else "rejected"
+    reason = None if status == "approved" else payload.reason.strip()
+    reviewed_at = datetime.now()
+    for script in scripts:
+        script.status = status
+        script.review_reason = reason
+        script.reviewed_by = user.id
+        script.reviewed_at = reviewed_at
+    await db.commit()
+    return scripts
 
 
 @router.post("/scripts/{script_id}/reject", response_model=ScriptResponse)
