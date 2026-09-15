@@ -132,7 +132,10 @@ async def second_verification_container(page, context=None):
                     container = containers.nth(index)
                     # 有些弹层根 div 自身没有尺寸，但内部文字或输入框可见。
                     sms_items = container.locator("div").filter(has_text=re.compile(r"接收\s*短信\s*验证码"))
-                    inputs = container.locator('#button-input, input[placeholder="请输入验证码"]')
+                    inputs = container.locator(
+                        '#button-input, input[placeholder="请输入验证码"], '
+                        'input[placeholder*="登录密码"], input[type="password"]'
+                    )
                     child_visible = any([
                         *[await sms_items.nth(i).is_visible() for i in range(await sms_items.count())],
                         *[await inputs.nth(i).is_visible() for i in range(await inputs.count())],
@@ -381,25 +384,49 @@ async def fill_and_submit_verification(container, code: str) -> bool:
     return False
 
 
-async def fill_and_submit_password(container, password: str) -> bool:
+async def fill_and_submit_password(container, password: str, input_box=None) -> bool:
     try:
-        input_box = await login_password_input(container)
         if input_box is None:
+            input_box = await login_password_input(container)
+        if input_box is None:
+            print("[LoginWorker] 未找到二次认证登录密码输入框", flush=True)
             return False
-        await input_box.fill("")
-        try:
-            # 逐字输入能稳定触发抖音受控输入框的 input/change 事件和按钮启用逻辑。
+        await input_box.click(timeout=3000)
+        await input_box.fill(password)
+        await asyncio.sleep(0.2)
+        if await input_box.input_value() != password:
+            await input_box.fill("")
             await input_box.press_sequentially(password, delay=35)
-        except Exception:
-            await input_box.fill(password)
-        await input_box.evaluate(
-            """element => {
-                element.dispatchEvent(new Event('input', { bubbles: true }));
-                element.dispatchEvent(new Event('change', { bubbles: true }));
-                element.blur();
-            }"""
-        )
+            await asyncio.sleep(0.2)
+        if await input_box.input_value() != password:
+            # React 受控输入框可能把自动输入回滚为空；调用原生 value setter 后
+            # 再派发 input/change，让 React 的值追踪器接收到真实变化。
+            await input_box.evaluate(
+                """(element, value) => {
+                    const setter = Object.getOwnPropertyDescriptor(
+                        HTMLInputElement.prototype, 'value'
+                    )?.set;
+                    if (setter) setter.call(element, value);
+                    else element.value = value;
+                    element.dispatchEvent(new InputEvent('input', {
+                        bubbles: true,
+                        inputType: 'insertText',
+                        data: value,
+                    }));
+                    element.dispatchEvent(new Event('change', { bubbles: true }));
+                }""",
+                password,
+            )
+            await asyncio.sleep(0.3)
+        if await input_box.input_value() != password:
+            print("[LoginWorker] 登录密码写入后被页面清空，停止点击验证", flush=True)
+            return False
+        print("[LoginWorker] 已确认登录密码写入二次认证输入框", flush=True)
+        await input_box.press("Tab")
         await asyncio.sleep(0.3)
+        if await input_box.input_value() != password:
+            print("[LoginWorker] 登录密码输入框失焦后被页面清空，停止点击验证", flush=True)
+            return False
         return await click_verification_button(container)
     except Exception as exc:
         print(
@@ -586,8 +613,13 @@ async def run_session(session_id: int):
                             verification_detected = True
                             print(f"[LoginWorker] 检测到二次认证区域 #uc-second-verify，会话 {session_id}", flush=True)
                         input_box = await verification_input(second_verify)
-                        password_box = global_password_box if global_password_box is not None else await login_password_input(second_verify)
-                        password_action_scope = password_scope if password_scope is not None else second_verify
+                        second_verify_password_box = await login_password_input(second_verify)
+                        if second_verify_password_box is not None:
+                            password_box = second_verify_password_box
+                            password_action_scope = second_verify
+                        else:
+                            password_box = global_password_box
+                            password_action_scope = password_scope if password_scope is not None else second_verify
                         if input_box is None and password_box is None:
                             methods = await verification_methods(second_verify)
                             current_signature = tuple((str(item["label"]), item["description"]) for item in methods)
@@ -702,7 +734,11 @@ async def run_session(session_id: int):
                                 encrypted_password = await redis_client.lpop(f"douyin:login:password:{session_id}")
                                 if encrypted_password:
                                     password = decrypt_transient_secret(encrypted_password)
-                                    submitted = await fill_and_submit_password(password_action_scope, password)
+                                    submitted = await fill_and_submit_password(
+                                        password_action_scope,
+                                        password,
+                                        password_box,
+                                    )
                                     password = ""
                                     if submitted:
                                         session.status = "password_verifying"
@@ -713,7 +749,7 @@ async def run_session(session_id: int):
                                         print(f"[LoginWorker] 已填写登录密码并点击验证，会话 {session_id}", flush=True)
                                     else:
                                         session.status = "password_required"
-                                        session.failure_reason = "未找到可点击的验证按钮，请重新提交"
+                                        session.failure_reason = "未能填写登录密码或点击验证按钮，请查看浏览器画面后重试"
                                         await db.commit()
                             await asyncio.sleep(0.5)
                             continue
