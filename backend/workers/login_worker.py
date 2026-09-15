@@ -562,9 +562,10 @@ async def fill_and_submit_password(container, password: str, input_box=None) -> 
         if await input_box.input_value() != password:
             print("[LoginWorker] 登录密码写入后被页面清空，停止点击验证", flush=True)
             return False
-        print("[LoginWorker] 已确认登录密码写入二次认证输入框", flush=True)
+        print("[LoginWorker] 已确认登录密码写入二次认证输入框，等待 1 秒后点击验证", flush=True)
         await input_box.press("Tab")
-        await asyncio.sleep(0.3)
+        # 密码写入并失焦后固定等待 1 秒，让抖音完成表单状态和按钮状态更新。
+        await asyncio.sleep(1)
         if await input_box.input_value() != password:
             print("[LoginWorker] 登录密码输入框失焦后被页面清空，停止点击验证", flush=True)
             return False
