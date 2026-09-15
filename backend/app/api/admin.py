@@ -21,6 +21,7 @@ from app.core.database import redis_client
 from app.core.crypto import encrypt_transient_secret
 from app.core.platform_settings import get_platform_settings, update_platform_settings
 from app.core.security import hash_password
+from app.core.task_lifecycle import delete_stopped_task, restart_stopped_task
 from app.dependencies import admin_user
 from app.models import (AccountLoginSession, AccountLog, CommentLog, DouyinAccount, Script,
                         SensitiveWord, SubscriptionPlan, Task, TaskAccount, User, Worker)
@@ -440,6 +441,26 @@ async def admin_stop_task(task_id: int, user: Annotated[User, Depends(admin_user
     for assignment in assignments:
         await redis_client.rpush(f"douyin:task-account:stop:{assignment.id}", "stop")
     return task
+
+
+@router.post("/tasks/{task_id}/start", response_model=TaskResponse)
+async def admin_restart_task(task_id: int, user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    task = await db.scalar(select(Task).where(
+        Task.id == task_id, Task.deleted_at.is_(None),
+    ).with_for_update())
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    return await restart_stopped_task(task, user.id, db)
+
+
+@router.delete("/tasks/{task_id}", status_code=204)
+async def admin_delete_task(task_id: int, user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    task = await db.scalar(select(Task).where(
+        Task.id == task_id, Task.deleted_at.is_(None),
+    ).with_for_update())
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    await delete_stopped_task(task, db)
 
 
 @router.get("/sensitive-words", response_model=list[SensitiveWordResponse])

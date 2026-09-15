@@ -553,17 +553,29 @@ async function showAccountLogs(row: any) {
     accountLogs.value = await response.json()
   } finally { accountLogLoading.value = false }
 }
-async function changeAdminTask(task: any, action: 'pause' | 'resume' | 'stop') {
+async function changeAdminTask(task: any, action: 'pause' | 'resume' | 'stop' | 'start') {
   if (action === 'stop') {
     const confirmed = await ElMessageBox.confirm('停止任务会释放所有执行账号，确认继续吗？', '停止任务', { type: 'warning' }).catch(() => false)
+    if (!confirmed) return
+  }
+  if (action === 'start') {
+    const confirmed = await ElMessageBox.confirm('将重新分配可用账号并从头启动该任务，确认继续吗？', '启动任务', { type: 'info' }).catch(() => false)
     if (!confirmed) return
   }
   const response = await fetch(`/api/admin/tasks/${task.id}/${action}`, { method: 'POST', headers: authHeaders() })
   if (!response.ok) { notify((await response.json()).detail || '任务操作失败', 'error'); return }
   const updated = await response.json()
-  notify(action === 'pause' ? '任务已暂停' : action === 'resume' ? '任务已继续' : '任务已停止', 'success')
+  notify(action === 'pause' ? '任务已暂停' : action === 'resume' ? '任务已继续' : action === 'start' ? '任务已重新启动' : '任务已停止', 'success')
   await load()
   if (taskDetailVisible.value) await openTaskDetail(updated)
+}
+async function deleteAdminTask(task: any) {
+  const confirmed = await ElMessageBox.confirm('删除后任务将不再显示，确认删除吗？', '删除任务', { type: 'warning', confirmButtonText: '确认删除' }).catch(() => false)
+  if (!confirmed) return
+  const response = await fetch(`/api/admin/tasks/${task.id}`, { method: 'DELETE', headers: authHeaders() })
+  if (!response.ok) { notify((await response.json()).detail || '删除任务失败', 'error'); return }
+  if (selectedAdminTask.value?.id === task.id) taskDetailVisible.value = false
+  notify('任务已删除', 'success'); await load()
 }
 function openCreateCustomer() {
   customerDialogMode.value = 'create'
@@ -834,14 +846,25 @@ async function deleteCustomerAccount(row: any) {
   if (!response.ok) { notify((await response.json()).detail || '删除失败', 'error'); return }
   notify('账号已删除', 'success'); await loadCustomer()
 }
-async function changeCustomerTask(task: any, action: 'pause' | 'resume' | 'stop') {
+async function changeCustomerTask(task: any, action: 'pause' | 'resume' | 'stop' | 'start') {
   if (action === 'stop') {
     const confirmed = await ElMessageBox.confirm('停止后将释放已分配账号，确认停止任务吗？', '提示', { type: 'warning' }).catch(() => false)
     if (!confirmed) return
   }
+  if (action === 'start') {
+    const confirmed = await ElMessageBox.confirm('将重新分配可用账号并从头启动该任务，确认继续吗？', '启动任务', { type: 'info' }).catch(() => false)
+    if (!confirmed) return
+  }
   const response = await fetch(`/api/customer/tasks/${task.id}/${action}`, { method: 'POST', headers: authHeaders() })
   if (!response.ok) { notify((await response.json()).detail || '操作失败', 'error'); return }
-  notify(action === 'pause' ? '任务已暂停' : action === 'resume' ? '任务已继续' : '任务已停止', 'success'); await loadCustomer()
+  notify(action === 'pause' ? '任务已暂停' : action === 'resume' ? '任务已继续' : action === 'start' ? '任务已重新启动' : '任务已停止', 'success'); await loadCustomer()
+}
+async function deleteCustomerTask(task: any) {
+  const confirmed = await ElMessageBox.confirm('删除后任务将不再显示，确认删除吗？', '删除任务', { type: 'warning', confirmButtonText: '确认删除' }).catch(() => false)
+  if (!confirmed) return
+  const response = await fetch(`/api/customer/tasks/${task.id}`, { method: 'DELETE', headers: authHeaders() })
+  if (!response.ok) { notify((await response.json()).detail || '删除任务失败', 'error'); return }
+  notify('任务已删除', 'success'); await loadCustomer()
 }
 async function showTaskLogs(task: any) {
   const response = await fetch(`/api/customer/tasks/${task.id}/comment-logs`, { headers: authHeaders() })
@@ -992,7 +1015,7 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
           </el-card>
           <el-card shadow="never">
             <div class="table-toolbar"><div class="table-title">任务列表</div><div class="record-total">共 {{ filteredTasks.length }} 条记录</div></div>
-            <el-table v-loading="loading" :data="paginatedTasks" border stripe style="width: 100%" empty-text="暂无数据"><el-table-column type="index" label="序号" width="70" fixed="left" :index="taskTableIndex" /><el-table-column label="所属客户" min-width="140"><template #default="{ row }">{{ customerName(row.customer_id) }}</template></el-table-column><el-table-column label="直播链接" min-width="220"><template #default="{ row }"><el-link :href="row.live_url" target="_blank" type="primary">{{ row.live_url }}</el-link></template></el-table-column><el-table-column label="账号模式" width="120"><template #default="{ row }">{{ row.account_source === 'customer' ? '客户自有' : '平台账号' }}</template></el-table-column><el-table-column label="评论模式" width="110"><template #default="{ row }">{{ row.script_order_mode === 'sequential' ? '顺序评论' : '随机评论' }}</template></el-table-column><el-table-column label="任务状态" width="120"><template #default="{ row }"><el-tag :type="taskStatusMeta(row.status)[1]">{{ taskStatusMeta(row.status)[0] }}</el-tag></template></el-table-column><el-table-column prop="target_account_count" label="账号数量" width="110" /><el-table-column label="评论间隔" width="150"><template #default="{ row }">{{ row.min_interval_seconds }}–{{ row.max_interval_seconds }} 秒</template></el-table-column><el-table-column prop="failure_reason" label="异常原因" min-width="190" show-overflow-tooltip><template #default="{ row }">{{ row.failure_reason || '—' }}</template></el-table-column><el-table-column label="创建时间" min-width="180"><template #default="{ row }">{{ formatDate(row.created_at) }}</template></el-table-column><el-table-column label="操作" width="230" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="openTaskDetail(row)">详情</el-button><el-button v-if="['pending', 'running'].includes(row.status)" link type="warning" @click="changeAdminTask(row, 'pause')">暂停</el-button><el-button v-if="row.status === 'paused'" link type="success" @click="changeAdminTask(row, 'resume')">继续</el-button><el-button v-if="['pending', 'running', 'paused'].includes(row.status)" link type="danger" @click="changeAdminTask(row, 'stop')">停止</el-button></template></el-table-column></el-table>
+            <el-table v-loading="loading" :data="paginatedTasks" border stripe style="width: 100%" empty-text="暂无数据"><el-table-column type="index" label="序号" width="70" fixed="left" :index="taskTableIndex" /><el-table-column label="所属客户" min-width="140"><template #default="{ row }">{{ customerName(row.customer_id) }}</template></el-table-column><el-table-column label="直播链接" min-width="220"><template #default="{ row }"><el-link :href="row.live_url" target="_blank" type="primary">{{ row.live_url }}</el-link></template></el-table-column><el-table-column label="账号模式" width="120"><template #default="{ row }">{{ row.account_source === 'customer' ? '客户自有' : '平台账号' }}</template></el-table-column><el-table-column label="评论模式" width="110"><template #default="{ row }">{{ row.script_order_mode === 'sequential' ? '顺序评论' : '随机评论' }}</template></el-table-column><el-table-column label="任务状态" width="120"><template #default="{ row }"><el-tag :type="taskStatusMeta(row.status)[1]">{{ taskStatusMeta(row.status)[0] }}</el-tag></template></el-table-column><el-table-column prop="target_account_count" label="账号数量" width="110" /><el-table-column label="评论间隔" width="150"><template #default="{ row }">{{ row.min_interval_seconds }}–{{ row.max_interval_seconds }} 秒</template></el-table-column><el-table-column prop="failure_reason" label="异常原因" min-width="190" show-overflow-tooltip><template #default="{ row }">{{ row.failure_reason || '—' }}</template></el-table-column><el-table-column label="创建时间" min-width="180"><template #default="{ row }">{{ formatDate(row.created_at) }}</template></el-table-column><el-table-column label="操作" width="260" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="openTaskDetail(row)">详情</el-button><el-button v-if="['pending', 'running'].includes(row.status)" link type="warning" @click="changeAdminTask(row, 'pause')">暂停</el-button><el-button v-if="row.status === 'paused'" link type="success" @click="changeAdminTask(row, 'resume')">继续</el-button><el-button v-if="['pending', 'running', 'paused'].includes(row.status)" link type="danger" @click="changeAdminTask(row, 'stop')">停止</el-button><el-button v-if="row.status === 'stopped'" link type="success" @click="changeAdminTask(row, 'start')">启动</el-button><el-button v-if="row.status === 'stopped'" link type="danger" @click="deleteAdminTask(row)">删除</el-button></template></el-table-column></el-table>
             <div class="pagination-row"><el-pagination background layout="total, sizes, prev, pager, next, jumper" :total="filteredTasks.length" v-model:current-page="taskPage" v-model:page-size="taskPageSize" :page-sizes="[10, 20, 50, 100]" /></div>
           </el-card>
         </template>
@@ -1057,7 +1080,7 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
 
     <el-dialog v-model="taskDetailVisible" title="任务详情" width="min(94vw, 980px)" align-center>
       <div v-loading="taskDetailLoading">
-        <el-descriptions v-if="selectedAdminTask" :column="4" border class="task-summary"><el-descriptions-item label="任务 ID">{{ selectedAdminTask.id }}</el-descriptions-item><el-descriptions-item label="所属客户">{{ customerName(selectedAdminTask.customer_id) }}</el-descriptions-item><el-descriptions-item label="直播链接"><el-link :href="selectedAdminTask.live_url" target="_blank" type="primary">打开直播间</el-link></el-descriptions-item><el-descriptions-item label="状态"><div class="detail-status"><el-tag :type="taskStatusMeta(selectedAdminTask.status)[1]">{{ taskStatusMeta(selectedAdminTask.status)[0] }}</el-tag><el-button v-if="['pending', 'running'].includes(selectedAdminTask.status)" link type="warning" @click="changeAdminTask(selectedAdminTask, 'pause')">暂停</el-button><el-button v-if="selectedAdminTask.status === 'paused'" link type="success" @click="changeAdminTask(selectedAdminTask, 'resume')">继续</el-button><el-button v-if="['pending', 'running', 'paused'].includes(selectedAdminTask.status)" link type="danger" @click="changeAdminTask(selectedAdminTask, 'stop')">停止</el-button></div></el-descriptions-item></el-descriptions>
+        <el-descriptions v-if="selectedAdminTask" :column="4" border class="task-summary"><el-descriptions-item label="任务 ID">{{ selectedAdminTask.id }}</el-descriptions-item><el-descriptions-item label="所属客户">{{ customerName(selectedAdminTask.customer_id) }}</el-descriptions-item><el-descriptions-item label="直播链接"><el-link :href="selectedAdminTask.live_url" target="_blank" type="primary">打开直播间</el-link></el-descriptions-item><el-descriptions-item label="状态"><div class="detail-status"><el-tag :type="taskStatusMeta(selectedAdminTask.status)[1]">{{ taskStatusMeta(selectedAdminTask.status)[0] }}</el-tag><el-button v-if="['pending', 'running'].includes(selectedAdminTask.status)" link type="warning" @click="changeAdminTask(selectedAdminTask, 'pause')">暂停</el-button><el-button v-if="selectedAdminTask.status === 'paused'" link type="success" @click="changeAdminTask(selectedAdminTask, 'resume')">继续</el-button><el-button v-if="['pending', 'running', 'paused'].includes(selectedAdminTask.status)" link type="danger" @click="changeAdminTask(selectedAdminTask, 'stop')">停止</el-button><el-button v-if="selectedAdminTask.status === 'stopped'" link type="success" @click="changeAdminTask(selectedAdminTask, 'start')">启动</el-button><el-button v-if="selectedAdminTask.status === 'stopped'" link type="danger" @click="deleteAdminTask(selectedAdminTask)">删除</el-button></div></el-descriptions-item></el-descriptions>
         <el-tabs class="task-detail-tabs">
           <el-tab-pane label="执行账号">
             <div v-if="selectedAdminTask && ['pending', 'running', 'paused'].includes(selectedAdminTask.status)" class="assignment-toolbar"><el-select v-model="addTaskAccountId" filterable clearable placeholder="选择闲置抖音账号"><el-option v-for="account in availableTaskAccounts" :key="account.id" :label="`${account.display_name}（ID: ${account.id}）`" :value="account.id" /></el-select><el-button type="primary" :disabled="!addTaskAccountId" @click="addTaskAccount">添加执行账号</el-button></div>
@@ -1105,7 +1128,7 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
 
       <template v-else-if="customerActive === 'tasks'">
         <div class="mobile-page-title"><div><h2>直播任务</h2><p>{{ currentPlan?.name || '标准版' }}同时最多运行 {{ activeTaskLimit }} 个任务</p></div><el-button type="primary" :disabled="activeCustomerTaskCount >= activeTaskLimit" @click="openCreateTask">新建任务</el-button></div>
-        <section v-for="task in customerTasks" :key="task.id" class="mobile-card task-card"><div class="mobile-card-title"><strong>直播任务</strong><el-tag :type="taskStatusMeta(task.status)[1]">{{ taskStatusMeta(task.status)[0] }}</el-tag></div><div class="task-details"><span>直播链接：<el-link :href="task.live_url" target="_blank" type="primary">打开直播间</el-link></span><span>账号模式：{{ task.account_source === 'customer' ? '我的账号' : '平台账号' }}</span><span>执行账号 {{ task.target_account_count }} 个</span><span>评论模式：{{ task.script_order_mode === 'sequential' ? '顺序评论' : '随机评论' }}</span><span>评论间隔 {{ task.min_interval_seconds }}–{{ task.max_interval_seconds }} 秒</span><span>{{ formatDate(task.created_at) }}</span></div><div class="task-actions"><el-button v-if="['pending', 'running'].includes(task.status)" size="small" @click="changeCustomerTask(task, 'pause')">暂停</el-button><el-button v-if="task.status === 'paused'" size="small" type="primary" @click="changeCustomerTask(task, 'resume')">继续</el-button><el-button v-if="['pending', 'running', 'paused'].includes(task.status)" size="small" type="danger" plain @click="changeCustomerTask(task, 'stop')">停止</el-button><el-button size="small" @click="showTaskLogs(task)">查看日志</el-button></div></section>
+        <section v-for="task in customerTasks" :key="task.id" class="mobile-card task-card"><div class="mobile-card-title"><strong>直播任务</strong><el-tag :type="taskStatusMeta(task.status)[1]">{{ taskStatusMeta(task.status)[0] }}</el-tag></div><div class="task-details"><span>直播链接：<el-link :href="task.live_url" target="_blank" type="primary">打开直播间</el-link></span><span>账号模式：{{ task.account_source === 'customer' ? '我的账号' : '平台账号' }}</span><span>执行账号 {{ task.target_account_count }} 个</span><span>评论模式：{{ task.script_order_mode === 'sequential' ? '顺序评论' : '随机评论' }}</span><span>评论间隔 {{ task.min_interval_seconds }}–{{ task.max_interval_seconds }} 秒</span><span>{{ formatDate(task.created_at) }}</span></div><div class="task-actions"><el-button v-if="['pending', 'running'].includes(task.status)" size="small" @click="changeCustomerTask(task, 'pause')">暂停</el-button><el-button v-if="task.status === 'paused'" size="small" type="primary" @click="changeCustomerTask(task, 'resume')">继续</el-button><el-button v-if="['pending', 'running', 'paused'].includes(task.status)" size="small" type="danger" plain @click="changeCustomerTask(task, 'stop')">停止</el-button><el-button v-if="task.status === 'stopped'" size="small" type="success" @click="changeCustomerTask(task, 'start')">启动</el-button><el-button v-if="task.status === 'stopped'" size="small" type="danger" plain @click="deleteCustomerTask(task)">删除</el-button><el-button size="small" @click="showTaskLogs(task)">查看日志</el-button></div></section>
         <el-empty v-if="!customerTasks.length" description="还没有直播任务" />
       </template>
 

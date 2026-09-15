@@ -10,6 +10,7 @@ from app.core.database import get_db, redis_client
 from app.core.douyin_urls import extract_douyin_live_url
 from app.core.platform_settings import get_platform_settings
 from app.core.subscriptions import get_customer_plan
+from app.core.task_lifecycle import delete_stopped_task, restart_stopped_task
 from app.dependencies import customer_user
 from app.models import (AccountLog, AccountLoginSession, CommentLog, DouyinAccount, PurchaseOrder, Script,
                         SubscriptionPlan, Task, TaskAccount, TaskScript, User)
@@ -486,3 +487,23 @@ async def resume_task(task_id: int, user: Annotated[User, Depends(customer_user)
 @router.post("/tasks/{task_id}/stop", response_model=TaskResponse)
 async def stop_task(task_id: int, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
     return await _change_task_status(task_id, "stopped", user, db)
+
+
+@router.post("/tasks/{task_id}/start", response_model=TaskResponse)
+async def restart_task(task_id: int, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    task = await db.scalar(select(Task).where(
+        Task.id == task_id, Task.customer_id == user.id, Task.deleted_at.is_(None),
+    ).with_for_update())
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    return await restart_stopped_task(task, user.id, db)
+
+
+@router.delete("/tasks/{task_id}", status_code=204)
+async def delete_task(task_id: int, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    task = await db.scalar(select(Task).where(
+        Task.id == task_id, Task.customer_id == user.id, Task.deleted_at.is_(None),
+    ).with_for_update())
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    await delete_stopped_task(task, db)
