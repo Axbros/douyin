@@ -74,6 +74,10 @@ frontend/.env.*
 !frontend/.env.example
 *.tsbuildinfo
 
+# CentOS / Docker production secrets
+deploy/centos/.env
+deploy/centos/backups/
+
 # ===== 抓包报告（含敏感请求信息）=====
 douyin_capture_report.txt
 douyin_like_verify_report.txt

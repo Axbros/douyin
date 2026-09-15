@@ -1,5 +1,9 @@
 # Linux 部署与进程管理
 
+CentOS Stream 9 全新服务器请使用 [CentOS 完整部署教程](CENTOS.md)。对应的 Docker Compose 配置位于 `deploy/centos/`。
+
+本页下面的原生安装方式面向 Ubuntu/Debian，`install_linux.sh` 使用 `apt-get`，不要在 CentOS 上执行。
+
 ## 浏览器是否需要桌面 UI
 
 服务器无需安装桌面环境。登录 Worker、账号浏览器 Worker 和任务 Worker 都通过 `xvfb-run` 启动。Xvfb 会为 Chromium 提供一块虚拟屏幕，Playwright 仍以 `headless=false` 的有界面模式运行，因此可以正常：
