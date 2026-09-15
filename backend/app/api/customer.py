@@ -12,7 +12,7 @@ from app.models import AccountLog, AccountLoginSession, CommentLog, DouyinAccoun
 from app.schemas import (AccountResponse, CommentLogResponse, DouyinAccountUpdate, LoginPasswordRequest,
                          LoginSessionResponse, LoginVerificationCodeRequest, LoginVerificationMethodRequest,
                          PlatformSettingsResponse, ScriptBulkCreate, ScriptCreate, ScriptResponse,
-                         TaskAccountResponse, TaskCreate, TaskResponse)
+                         ScriptUpdate, TaskAccountResponse, TaskCreate, TaskResponse)
 
 router = APIRouter(prefix="/api/customer", tags=["customer"])
 
@@ -198,6 +198,42 @@ async def submit_review(script_id: int, user: Annotated[User, Depends(customer_u
     await db.commit()
     await db.refresh(script)
     return script
+
+
+@router.patch("/scripts/{script_id}", response_model=ScriptResponse)
+async def update_script(script_id: int, payload: ScriptUpdate, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    script = await db.scalar(select(Script).where(
+        Script.id == script_id, Script.customer_id == user.id, Script.deleted_at.is_(None)
+    ))
+    if not script:
+        raise HTTPException(404, "话术不存在")
+    if script.status not in {"draft", "rejected"}:
+        raise HTTPException(409, "只有草稿或审核未通过的话术可以修改")
+    values = payload.model_dump(exclude_unset=True)
+    for name in ("title", "content"):
+        if name in values:
+            values[name] = values[name].strip()
+            if not values[name]:
+                raise HTTPException(422, "话术标题和内容不能为空")
+    for name, value in values.items():
+        setattr(script, name, value)
+    script.status = "draft"
+    script.review_reason = None
+    await db.commit(); await db.refresh(script)
+    return script
+
+
+@router.delete("/scripts/{script_id}", status_code=204)
+async def delete_script(script_id: int, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    script = await db.scalar(select(Script).where(
+        Script.id == script_id, Script.customer_id == user.id, Script.deleted_at.is_(None)
+    ))
+    if not script:
+        raise HTTPException(404, "话术不存在")
+    if script.status not in {"draft", "rejected"}:
+        raise HTTPException(409, "只有草稿或审核未通过的话术可以删除")
+    script.deleted_at = datetime.now()
+    await db.commit()
 
 
 @router.post("/tasks", response_model=TaskResponse, status_code=201)

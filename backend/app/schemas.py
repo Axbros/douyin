@@ -71,6 +71,12 @@ class ScriptCreate(BaseModel):
     weight: int = Field(default=1, ge=1, le=100)
 
 
+class ScriptUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=150)
+    content: str | None = Field(default=None, min_length=1, max_length=500)
+    weight: int | None = Field(default=None, ge=1, le=100)
+
+
 class ScriptBulkCreate(BaseModel):
     contents: list[str] = Field(min_length=1, max_length=1000)
 
