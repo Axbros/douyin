@@ -891,6 +891,15 @@ async def account_logs(account_id: int, user: Annotated[User, Depends(admin_user
     return list(result)
 
 
+@router.get("/douyin-accounts/{account_id}/comment-logs", response_model=list[CommentLogResponse])
+async def account_comment_logs(account_id: int, user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    await _get_douyin_account(account_id, db)
+    result = await db.scalars(select(CommentLog).where(
+        CommentLog.account_id == account_id, CommentLog.deleted_at.is_(None),
+    ).order_by(CommentLog.id.desc()).limit(500))
+    return list(result)
+
+
 def _script_result(script: Script, customer_login: str, customer_name: str) -> dict:
     return {
         "id": script.id,
