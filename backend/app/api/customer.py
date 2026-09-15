@@ -10,7 +10,7 @@ from app.core.database import get_db, redis_client
 from app.core.douyin_urls import extract_douyin_live_url
 from app.core.platform_settings import get_platform_settings
 from app.core.subscriptions import get_customer_plan
-from app.core.task_lifecycle import delete_stopped_task, restart_stopped_task
+from app.core.task_lifecycle import delete_stopped_task, restart_stopped_task, update_stopped_task
 from app.dependencies import customer_user
 from app.models import (AccountLog, AccountLoginSession, CommentLog, DouyinAccount, PurchaseOrder, Script,
                         SubscriptionPlan, Task, TaskAccount, TaskScript, User)
@@ -18,7 +18,8 @@ from app.schemas import (AccountResponse, CommentLogResponse, DouyinAccountUpdat
                          LoginSessionResponse, LoginVerificationCodeRequest, LoginVerificationMethodRequest,
                          CustomerSubscriptionResponse, PlatformSettingsResponse, PurchaseOrderCreate,
                          PurchaseOrderResponse, ScriptBulkCreate, ScriptCreate, ScriptResponse,
-                         ScriptUpdate, SubscriptionPlanResponse, TaskAccountResponse, TaskCreate, TaskResponse)
+                         ScriptUpdate, SubscriptionPlanResponse, TaskAccountResponse, TaskCreate,
+                         TaskEditResponse, TaskResponse, TaskUpdate)
 
 router = APIRouter(prefix="/api/customer", tags=["customer"])
 
@@ -399,6 +400,32 @@ async def get_task(task_id: int, user: Annotated[User, Depends(customer_user)], 
     if not task:
         raise HTTPException(404, "任务不存在")
     return task
+
+
+@router.get("/tasks/{task_id}/edit-data", response_model=TaskEditResponse)
+async def get_task_edit_data(task_id: int, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    task = await db.scalar(select(Task).where(
+        Task.id == task_id, Task.customer_id == user.id, Task.deleted_at.is_(None),
+    ))
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    script_ids = list(await db.scalars(select(TaskScript.script_id).where(
+        TaskScript.task_id == task.id, TaskScript.deleted_at.is_(None),
+    ).order_by(TaskScript.sort_order.asc(), TaskScript.id.asc())))
+    account_ids = list(await db.scalars(select(TaskAccount.account_id).where(
+        TaskAccount.task_id == task.id, TaskAccount.deleted_at.is_(None),
+    ).order_by(TaskAccount.id.asc()))) if task.account_source == "customer" else []
+    return TaskEditResponse(task=task, script_ids=script_ids, account_ids=account_ids)
+
+
+@router.patch("/tasks/{task_id}", response_model=TaskResponse)
+async def update_task(task_id: int, payload: TaskUpdate, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    task = await db.scalar(select(Task).where(
+        Task.id == task_id, Task.customer_id == user.id, Task.deleted_at.is_(None),
+    ).with_for_update())
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    return await update_stopped_task(task, payload, db)
 
 
 @router.get("/tasks/{task_id}/comment-logs", response_model=list[CommentLogResponse])

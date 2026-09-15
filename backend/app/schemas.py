@@ -129,6 +129,10 @@ class TaskCreate(BaseModel):
     script_order_mode: str = Field(default="random", pattern="^(random|sequential)$")
 
 
+class TaskUpdate(TaskCreate):
+    pass
+
+
 class TaskResponse(BaseModel):
     id: int
     customer_id: int
@@ -146,6 +150,12 @@ class TaskResponse(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class TaskEditResponse(BaseModel):
+    task: TaskResponse
+    script_ids: list[int]
+    account_ids: list[int]
 
 
 class CommentLogResponse(BaseModel):

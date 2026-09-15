@@ -115,6 +115,8 @@ const customerScriptEditLoading = ref(false)
 const customerScriptForm = ref({ id: 0, title: '', content: '', weight: 1 })
 const createTaskVisible = ref(false)
 const createTaskLoading = ref(false)
+const taskDialogMode = ref<'create' | 'edit'>('create')
+const editingTaskId = ref<number | null>(null)
 const taskForm = ref({ live_share_text: '', script_ids: [] as number[], min_interval_seconds: 20, max_interval_seconds: 50, account_source: 'platform', account_ids: [] as number[], script_order_mode: 'random' })
 const parsedLiveUrl = ref('')
 const liveUrlParseError = ref('')
@@ -751,8 +753,29 @@ function openCreateTask() {
   if (!approvedCustomerScripts.value.length) { notify('没有审核通过的话术，暂时不能创建任务', 'warning'); return }
   const minInterval = Math.min(Math.max(20, platformSettings.value.comment_min_interval_seconds), platformSettings.value.comment_max_interval_seconds)
   const maxInterval = Math.min(Math.max(50, minInterval), platformSettings.value.comment_max_interval_seconds)
+  taskDialogMode.value = 'create'
+  editingTaskId.value = null
   taskForm.value = { live_share_text: '', script_ids: [], min_interval_seconds: minInterval, max_interval_seconds: maxInterval, account_source: 'platform', account_ids: [], script_order_mode: 'random' }
   parsedLiveUrl.value = ''
+  liveUrlParseError.value = ''
+  createTaskVisible.value = true
+}
+async function openEditTask(task: any) {
+  const response = await fetch(`/api/customer/tasks/${task.id}/edit-data`, { headers: authHeaders() })
+  if (!response.ok) { notify((await response.json()).detail || '读取任务配置失败', 'error'); return }
+  const data = await response.json()
+  taskDialogMode.value = 'edit'
+  editingTaskId.value = task.id
+  taskForm.value = {
+    live_share_text: data.task.live_url,
+    script_ids: data.script_ids,
+    min_interval_seconds: data.task.min_interval_seconds,
+    max_interval_seconds: data.task.max_interval_seconds,
+    account_source: data.task.account_source,
+    account_ids: data.account_ids,
+    script_order_mode: data.task.script_order_mode,
+  }
+  parsedLiveUrl.value = data.task.live_url
   liveUrlParseError.value = ''
   createTaskVisible.value = true
 }
@@ -800,14 +823,19 @@ async function createCustomerTask() {
   const modeName = form.account_source === 'customer' ? '我的账号' : '平台账号'
   const orderModeName = form.script_order_mode === 'sequential' ? '顺序评论' : '随机评论'
   const accountCount = form.account_source === 'customer' ? form.account_ids.length : platformTaskAccountCount.value
-  const confirmed = await ElMessageBox.confirm(`将使用${modeName}（${accountCount} 个）执行${orderModeName}。确认创建任务吗？`, '确认创建直播任务', { confirmButtonText: '确认创建', cancelButtonText: '返回修改', type: 'warning' }).catch(() => false)
+  const editing = taskDialogMode.value === 'edit' && editingTaskId.value !== null
+  const confirmed = await ElMessageBox.confirm(
+    editing ? `将保存${modeName}（${accountCount} 个）及${orderModeName}配置，任务仍保持已停止。` : `将使用${modeName}（${accountCount} 个）执行${orderModeName}。确认创建任务吗？`,
+    editing ? '确认保存任务' : '确认创建直播任务',
+    { confirmButtonText: editing ? '保存修改' : '确认创建', cancelButtonText: '返回修改', type: 'warning' },
+  ).catch(() => false)
   if (!confirmed) return
   createTaskLoading.value = true
   try {
     const orderedScriptIds = selectableTaskScripts.value.filter(script => form.script_ids.includes(script.id)).map(script => script.id)
-    const response = await fetch('/api/customer/tasks', { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ ...form, live_share_text: form.live_share_text.trim(), script_ids: orderedScriptIds }) })
-    if (!response.ok) { notify((await response.json()).detail || '创建任务失败', 'error'); return }
-    createTaskVisible.value = false; notify('直播任务创建成功', 'success'); customerActive.value = 'tasks'; await loadCustomer()
+    const response = await fetch(editing ? `/api/customer/tasks/${editingTaskId.value}` : '/api/customer/tasks', { method: editing ? 'PATCH' : 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ ...form, live_share_text: form.live_share_text.trim(), script_ids: orderedScriptIds }) })
+    if (!response.ok) { notify((await response.json()).detail || (editing ? '保存任务失败' : '创建任务失败'), 'error'); return }
+    createTaskVisible.value = false; notify(editing ? '任务修改已保存' : '直播任务创建成功', 'success'); customerActive.value = 'tasks'; await loadCustomer()
   } finally { createTaskLoading.value = false }
 }
 async function createPlanOrder(plan: any) {
@@ -1128,7 +1156,7 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
 
       <template v-else-if="customerActive === 'tasks'">
         <div class="mobile-page-title"><div><h2>直播任务</h2><p>{{ currentPlan?.name || '标准版' }}同时最多运行 {{ activeTaskLimit }} 个任务</p></div><el-button type="primary" :disabled="activeCustomerTaskCount >= activeTaskLimit" @click="openCreateTask">新建任务</el-button></div>
-        <section v-for="task in customerTasks" :key="task.id" class="mobile-card task-card"><div class="mobile-card-title"><strong>直播任务</strong><el-tag :type="taskStatusMeta(task.status)[1]">{{ taskStatusMeta(task.status)[0] }}</el-tag></div><div class="task-details"><span>直播链接：<el-link :href="task.live_url" target="_blank" type="primary">打开直播间</el-link></span><span>账号模式：{{ task.account_source === 'customer' ? '我的账号' : '平台账号' }}</span><span>执行账号 {{ task.target_account_count }} 个</span><span>评论模式：{{ task.script_order_mode === 'sequential' ? '顺序评论' : '随机评论' }}</span><span>评论间隔 {{ task.min_interval_seconds }}–{{ task.max_interval_seconds }} 秒</span><span>{{ formatDate(task.created_at) }}</span></div><div class="task-actions"><el-button v-if="['pending', 'running'].includes(task.status)" size="small" @click="changeCustomerTask(task, 'pause')">暂停</el-button><el-button v-if="task.status === 'paused'" size="small" type="primary" @click="changeCustomerTask(task, 'resume')">继续</el-button><el-button v-if="['pending', 'running', 'paused'].includes(task.status)" size="small" type="danger" plain @click="changeCustomerTask(task, 'stop')">停止</el-button><el-button v-if="task.status === 'stopped'" size="small" type="success" @click="changeCustomerTask(task, 'start')">启动</el-button><el-button v-if="task.status === 'stopped'" size="small" type="danger" plain @click="deleteCustomerTask(task)">删除</el-button><el-button size="small" @click="showTaskLogs(task)">查看日志</el-button></div></section>
+        <section v-for="task in customerTasks" :key="task.id" class="mobile-card task-card"><div class="mobile-card-title"><strong>直播任务</strong><el-tag :type="taskStatusMeta(task.status)[1]">{{ taskStatusMeta(task.status)[0] }}</el-tag></div><div class="task-details"><span>直播链接：<el-link :href="task.live_url" target="_blank" type="primary">打开直播间</el-link></span><span>账号模式：{{ task.account_source === 'customer' ? '我的账号' : '平台账号' }}</span><span>执行账号 {{ task.target_account_count }} 个</span><span>评论模式：{{ task.script_order_mode === 'sequential' ? '顺序评论' : '随机评论' }}</span><span>评论间隔 {{ task.min_interval_seconds }}–{{ task.max_interval_seconds }} 秒</span><span>{{ formatDate(task.created_at) }}</span></div><div class="task-actions"><el-button v-if="['pending', 'running'].includes(task.status)" size="small" @click="changeCustomerTask(task, 'pause')">暂停</el-button><el-button v-if="task.status === 'paused'" size="small" type="primary" @click="changeCustomerTask(task, 'resume')">继续</el-button><el-button v-if="['pending', 'running', 'paused'].includes(task.status)" size="small" type="danger" plain @click="changeCustomerTask(task, 'stop')">停止</el-button><el-button v-if="task.status === 'stopped'" size="small" @click="openEditTask(task)">编辑</el-button><el-button v-if="task.status === 'stopped'" size="small" type="success" @click="changeCustomerTask(task, 'start')">启动</el-button><el-button v-if="task.status === 'stopped'" size="small" type="danger" plain @click="deleteCustomerTask(task)">删除</el-button><el-button size="small" @click="showTaskLogs(task)">查看日志</el-button></div></section>
         <el-empty v-if="!customerTasks.length" description="还没有直播任务" />
       </template>
 
@@ -1163,7 +1191,7 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
 
     <el-dialog v-model="importVisible" title="批量导入话术" width="min(92vw, 520px)" align-center><p class="dialog-help">每行填写一条话术，单次最多导入 {{ platformSettings.script_bulk_import_limit }} 条。导入后将自动提交管理员审核。</p><el-input v-model="importText" type="textarea" :rows="10" placeholder="欢迎来到直播间&#10;喜欢的朋友可以关注一下&#10;有问题可以在评论区留言" /><template #footer><el-button @click="importVisible = false">取消</el-button><el-button type="primary" :loading="importLoading" @click="importScripts">导入并提交审核</el-button></template></el-dialog>
     <el-dialog v-model="customerScriptEditVisible" title="编辑话术" width="min(92vw, 520px)" align-center><el-form label-position="top"><el-form-item label="标题"><el-input v-model="customerScriptForm.title" maxlength="150" /></el-form-item><el-form-item label="评论内容"><el-input v-model="customerScriptForm.content" type="textarea" :rows="5" maxlength="500" show-word-limit /></el-form-item><el-form-item label="随机权重"><el-input-number v-model="customerScriptForm.weight" :min="1" :max="100" /></el-form-item></el-form><template #footer><el-button @click="customerScriptEditVisible = false">取消</el-button><el-button type="primary" :loading="customerScriptEditLoading" @click="saveCustomerScript">保存草稿</el-button></template></el-dialog>
-    <el-dialog v-model="createTaskVisible" title="创建直播任务" width="min(92vw, 620px)" align-center>
+    <el-dialog v-model="createTaskVisible" :title="taskDialogMode === 'edit' ? '编辑直播任务' : '创建直播任务'" width="min(92vw, 620px)" align-center>
       <el-form label-position="top">
         <el-form-item label="账号模式">
           <el-radio-group v-model="taskForm.account_source" class="mode-options" @change="taskForm.account_ids = []">
@@ -1223,7 +1251,7 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
           <el-form-item label="最大间隔（秒）"><el-input-number v-model="taskForm.max_interval_seconds" :min="platformSettings.comment_min_interval_seconds" :max="platformSettings.comment_max_interval_seconds" /></el-form-item>
         </div>
       </el-form>
-      <template #footer><el-button @click="createTaskVisible = false">取消</el-button><el-button type="primary" :disabled="!parsedLiveUrl" :loading="createTaskLoading" @click="createCustomerTask">创建任务</el-button></template>
+      <template #footer><el-button @click="createTaskVisible = false">取消</el-button><el-button type="primary" :disabled="!parsedLiveUrl" :loading="createTaskLoading" @click="createCustomerTask">{{ taskDialogMode === 'edit' ? '保存修改' : '创建任务' }}</el-button></template>
     </el-dialog>
     <el-dialog v-model="quotaPurchaseVisible" title="购买额外账号额度" width="min(92vw, 420px)" align-center>
       <el-form label-position="top"><el-form-item label="购买数量"><el-input-number v-model="quotaPurchaseQuantity" :min="1" :max="100" /></el-form-item></el-form>
