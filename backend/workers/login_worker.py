@@ -95,8 +95,9 @@ async def wait_for_manual_close(session_id: int, browser, context, playwright):
 
 async def navigate_or_close(page, url: str, session_id: int, browser, context, playwright) -> bool:
     """导航期间同时监听关闭指令；返回 True 表示浏览器已被关闭。"""
-    # commit 只等待服务器开始返回页面，之后立即查找按钮，不等待整页资源加载。
-    navigation = asyncio.create_task(page.goto(url, wait_until="commit", timeout=30000))
+    # 必须等页面触发 load 事件后才允许点击登录按钮，避免页面初始化过程中
+    # 弹层或遮罩尚未稳定，导致点击落在旧节点上。
+    navigation = asyncio.create_task(page.goto(url, wait_until="load", timeout=60000))
     closing = asyncio.create_task(redis_client.blpop(f"douyin:login:close:{session_id}", timeout=0))
     done, _ = await asyncio.wait({navigation, closing}, return_when=asyncio.FIRST_COMPLETED)
     if closing in done:
@@ -414,7 +415,7 @@ async def run_session(session_id: int):
             try:
                 if await navigate_or_close(page, platform.home_url, session_id, browser, context, p):
                     return
-                print(f"[LoginWorker] 抖音页面开始加载，会话 {session_id}，立即查找登录按钮", flush=True)
+                print(f"[LoginWorker] 抖音页面加载完毕，会话 {session_id}，开始查找登录按钮", flush=True)
                 clicked = False
                 for _ in range(60):
                     if await redis_client.lpop(f"douyin:login:close:{session_id}"):
