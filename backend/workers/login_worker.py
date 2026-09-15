@@ -440,45 +440,47 @@ async def run_session(session_id: int):
                 mime = ""
                 encoded = ""
                 chosen_area = 0
-                for qr_attempt in range(2):
-                    # 每次最多等待 3 秒（6 × 0.5 秒）获取有效二维码。
-                    for _ in range(6):
-                        if await redis_client.lpop(f"douyin:login:close:{session_id}"):
-                            await close_browser(session_id, browser, context, p)
-                            return
-                        for selector in qr_selectors:
-                            candidates = page.locator(selector)
-                            for index in range(await candidates.count()):
-                                candidate = candidates.nth(index)
-                                if not await candidate.is_visible():
-                                    continue
-                                src = await candidate.get_attribute("src")
-                                if not src or not src.startswith("data:image/") or "," not in src:
-                                    continue
-                                header, candidate_encoded = src.split(",", 1)
-                                candidate_mime = header.split(";", 1)[0][5:]
-                                try:
-                                    decoded = base64.b64decode(candidate_encoded, validate=True)
-                                    area = await candidate.evaluate("el => el.getBoundingClientRect().width * el.getBoundingClientRect().height")
-                                except Exception:
-                                    continue
-                                if candidate_mime == "image/png" and decoded.startswith(b"\x89PNG") and len(decoded) > 500 and area > chosen_area:
-                                    image = decoded
-                                    mime = candidate_mime
-                                    encoded = candidate_encoded
-                                    chosen_area = area
-                        if image is not None:
-                            break
-                        await asyncio.sleep(0.5)
+                for qr_attempt in range(1, 11):
+                    if await redis_client.lpop(f"douyin:login:close:{session_id}"):
+                        await close_browser(session_id, browser, context, p)
+                        return
+                    for selector in qr_selectors:
+                        candidates = page.locator(selector)
+                        for index in range(await candidates.count()):
+                            candidate = candidates.nth(index)
+                            if not await candidate.is_visible():
+                                continue
+                            src = await candidate.get_attribute("src")
+                            if not src or not src.startswith("data:image/") or "," not in src:
+                                continue
+                            header, candidate_encoded = src.split(",", 1)
+                            candidate_mime = header.split(";", 1)[0][5:]
+                            try:
+                                decoded = base64.b64decode(candidate_encoded, validate=True)
+                                area = await candidate.evaluate("el => el.getBoundingClientRect().width * el.getBoundingClientRect().height")
+                            except Exception:
+                                continue
+                            if candidate_mime == "image/png" and decoded.startswith(b"\x89PNG") and len(decoded) > 500 and area > chosen_area:
+                                image = decoded
+                                mime = candidate_mime
+                                encoded = candidate_encoded
+                                chosen_area = area
                     if image is not None:
                         break
-                    print("[LoginWorker] 未读取到有效二维码，重新点击登录按钮后再次读取", flush=True)
-                    clicked_again = await platform.click_login_button(page, log_missing=False)
-                    if not clicked_again:
-                        print("[LoginWorker] 重试时未找到可点击的登录按钮", flush=True)
-                    await asyncio.sleep(0.5)
+                    if qr_attempt < 10:
+                        print(
+                            f"[LoginWorker] 第 {qr_attempt}/10 次未读取到有效二维码，3 秒后重试",
+                            flush=True,
+                        )
+                        close_requested = await redis_client.blpop(
+                            f"douyin:login:close:{session_id}",
+                            timeout=3,
+                        )
+                        if close_requested:
+                            await close_browser(session_id, browser, context, p)
+                            return
                 if image is None:
-                    raise RuntimeError("重新点击登录按钮后仍未读取到有效的抖音登录二维码 img.src")
+                    raise RuntimeError("连续 10 次未读取到有效的抖音登录二维码 img.src")
                 print(
                     f"[LoginWorker] 获取到登录二维码: mime={mime}, base64_length={len(encoded)}, area={chosen_area:.0f}",
                     flush=True,
