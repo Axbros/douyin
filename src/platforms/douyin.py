@@ -183,14 +183,14 @@ class DouyinPlatform(Platform):
                 continue
         return False
 
-    async def click_login_button(self, page, log_missing: bool = True) -> bool:
+    async def click_login_button(self, page, log_missing: bool = True, force: bool = False) -> bool:
         """确保登录面板已经打开。
 
         抖音前端的 CSS class/id 可能每次发布都变化，因此优先使用可访问名称和
         可见文本定位，最后才使用 p 标签文本作为兜底。若登录面板已经出现，
         直接返回成功，避免重复点击被弹窗遮挡的页面按钮。
         """
-        if await self.login_panel_visible(page):
+        if not force and await self.login_panel_visible(page):
             print("[DouyinPlatform] 登录面板已打开，无需重复点击登录按钮", flush=True)
             return True
 
@@ -205,13 +205,19 @@ class DouyinPlatform(Platform):
                 for index in range(count):
                     item = locator.nth(index)
                     if await item.is_visible() and await item.is_enabled():
-                        await item.click(timeout=1500)
-                        print("[DouyinPlatform] 已点击登录按钮", flush=True)
+                        if force:
+                            # 弹层会拦截真实指针事件；直接触发目标节点的 DOM click，
+                            # 确保二维码重试时底层登录入口能够再次执行。
+                            await item.evaluate("element => element.click()")
+                        else:
+                            await item.click(timeout=1500)
+                        action = "重新触发" if force else "点击"
+                        print(f"[DouyinPlatform] 已{action}登录按钮", flush=True)
                         return True
             except Exception as exc:
                 # 点击等待期间登录面板可能已由页面自身或前一个候选打开。此时底层
                 # “登录”文字会被面板拦截指针事件，但流程实际上已经可以读取二维码。
-                if await self.login_panel_visible(page):
+                if not force and await self.login_panel_visible(page):
                     print("[DouyinPlatform] 登录面板已出现，跳过被遮挡的登录按钮", flush=True)
                     return True
                 print(f"[DouyinPlatform] 登录按钮候选定位失败: {type(exc).__name__}: {exc}", flush=True)
@@ -653,7 +659,7 @@ class DouyinPlatform(Platform):
                                     const el = document.getElementById(id);
                                     if (!el) continue;
                                     const text = el.textContent || '';
-                                    const matches = text.matchAll(/"room_?id"\\s*[:=]\\s*"?(\d{10,})"?/g);
+                                    const matches = text.matchAll(/"room_?id"\\s*[:=]\\s*"?(\\d{10,})"?/g);
                                     for (const m of matches) addNum(m[1]);
                                 }
                             } catch (_) {}
@@ -683,7 +689,7 @@ class DouyinPlatform(Platform):
                             // 5. HTML 里所有 room_id 附近的10位+数字
                             try {
                                 const html = document.documentElement.innerHTML;
-                                const roomMatches = html.matchAll(/"room_?id"\\s*[:=]\\s*"?(\d{10,})"?/g);
+                                const roomMatches = html.matchAll(/"room_?id"\\s*[:=]\\s*"?(\\d{10,})"?/g);
                                 for (const m of roomMatches) addNum(m[1]);
                             } catch (_) {}
 

@@ -469,7 +469,8 @@ async def run_session(session_id: int):
                         break
                     if qr_attempt < 10:
                         print(
-                            f"[LoginWorker] 第 {qr_attempt}/10 次未读取到有效二维码，3 秒后重试",
+                            f"[LoginWorker] 第 {qr_attempt}/10 次未读取到有效二维码，"
+                            "3 秒后重新点击登录并读取",
                             flush=True,
                         )
                         close_requested = await redis_client.blpop(
@@ -479,6 +480,16 @@ async def run_session(session_id: int):
                         if close_requested:
                             await close_browser(session_id, browser, context, p)
                             return
+                        clicked_again = await platform.click_login_button(
+                            page,
+                            log_missing=False,
+                            force=True,
+                        )
+                        if not clicked_again:
+                            print(
+                                f"[LoginWorker] 第 {qr_attempt + 1}/10 次重试未找到登录按钮，继续读取二维码",
+                                flush=True,
+                            )
                 if image is None:
                     raise RuntimeError("连续 10 次未读取到有效的抖音登录二维码 img.src")
                 print(
