@@ -310,8 +310,38 @@ async def find_login_password_context(page, context=None):
     return None, None
 
 
-async def click_verification_button(container) -> bool:
+async def click_verification_button(container, input_box=None) -> bool:
     try:
+        # 密码验证页可能还有其他“验证”文字。从已经填写的输入框开始，优先
+        # 点击它后方最近的按钮，确保命中输入框底部的提交操作。
+        if input_box is not None:
+            following_labels = input_box.locator(
+                "xpath=following::*[normalize-space(string(.))='验证']"
+            )
+            fallback_label = None
+            for index in range(await following_labels.count()):
+                label = following_labels.nth(index)
+                if not await label.is_visible():
+                    continue
+                if fallback_label is None:
+                    fallback_label = label
+                clickable_ancestor = label.locator(
+                    "xpath=ancestor-or-self::*[self::button or @role='button' or "
+                    "contains(@class, 'btn')][1]"
+                )
+                if not await clickable_ancestor.count():
+                    continue
+                target = clickable_ancestor.first
+                try:
+                    await target.click(timeout=3000)
+                except Exception:
+                    await target.evaluate("element => element.click()")
+                print("[LoginWorker] 已点击密码输入框底部的验证按钮", flush=True)
+                return True
+            if fallback_label is not None:
+                await fallback_label.evaluate("element => element.click()")
+                print("[LoginWorker] 已触发密码输入框底部的验证文字", flush=True)
+                return True
         selectors = (
             '[class*="verification_component_btn-"]',
             'button',
@@ -378,7 +408,7 @@ async def fill_and_submit_verification(container, code: str) -> bool:
             return False
         await input_box.fill(code)
         await asyncio.sleep(0.2)
-        return await click_verification_button(container)
+        return await click_verification_button(container, input_box)
     except Exception:
         pass
     return False
@@ -392,11 +422,12 @@ async def fill_and_submit_password(container, password: str, input_box=None) -> 
             print("[LoginWorker] 未找到二次认证登录密码输入框", flush=True)
             return False
         await input_box.click(timeout=3000)
-        await input_box.fill(password)
+        await input_box.fill("")
+        # 优先模拟真实键盘输入，让抖音的 React 表单同步密码状态并解除按钮禁用。
+        await input_box.press_sequentially(password, delay=35)
         await asyncio.sleep(0.2)
         if await input_box.input_value() != password:
-            await input_box.fill("")
-            await input_box.press_sequentially(password, delay=35)
+            await input_box.fill(password)
             await asyncio.sleep(0.2)
         if await input_box.input_value() != password:
             # React 受控输入框可能把自动输入回滚为空；调用原生 value setter 后
@@ -427,7 +458,7 @@ async def fill_and_submit_password(container, password: str, input_box=None) -> 
         if await input_box.input_value() != password:
             print("[LoginWorker] 登录密码输入框失焦后被页面清空，停止点击验证", flush=True)
             return False
-        return await click_verification_button(container)
+        return await click_verification_button(container, input_box)
     except Exception as exc:
         print(
             f"[LoginWorker] 填写登录密码或提交验证异常: {type(exc).__name__}: {exc}",
