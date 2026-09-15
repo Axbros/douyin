@@ -4,7 +4,7 @@
 
 ## 1. 服务器要求
 
-测试环境建议至少使用 4 核 CPU、8 GB 内存和 50 GB SSD，安全组开放 TCP 22、80；配置 HTTPS 后再开放 443。正式运行多个账号时建议从 8 核、16 GB 内存起步，部署后根据同时工作的浏览器数量观察内存占用。
+测试环境建议至少使用 4 核 CPU、8 GB 内存和 50 GB SSD，安全组开放 TCP 22、8088；配置 HTTPS 后再开放 443。正式运行多个账号时建议从 8 核、16 GB 内存起步，部署后根据同时工作的浏览器数量观察内存占用。
 
 ```bash
 cat /etc/centos-release
@@ -84,7 +84,7 @@ jwt_secret = token_hex(32)
 fernet_key = urlsafe_b64encode(token_bytes(32)).decode()
 
 Path('.env').write_text(f'''COMPOSE_PROJECT_NAME=douyin
-PUBLIC_PORT=80
+PUBLIC_PORT=8088
 TZ=Asia/Shanghai
 
 MYSQL_DATABASE=douyin
@@ -141,18 +141,39 @@ Docker 基础镜像会经过上一节配置的镜像加速器。如果有自己�
 ./check_mirrors.sh
 ```
 
-## 5. 启动全部服务
+## 5. 选择启动版本
+
+两个版本共用同一个 `.env`、数据库和持久化数据，只切换构建时的依赖下载地址。
+
+### 中国大陆服务器
+
+使用阿里云 Debian、清华 PyPI、npmmirror npm 和 Playwright 镜像：
 
 ```bash
 cd /opt/douyin/deploy/centos
-./manage.sh start
+./start-cn.sh
 ```
 
 第一次构建会通过国内镜像下载 Python 包、前端依赖和 Chromium，通常需要几分钟。随后检查：
 
+### 中国大陆以外服务器
+
+使用 Debian、PyPI、npm 和微软 Playwright 官方源：
+
+```bash
+cd /opt/douyin/deploy/centos
+./start-global.sh
+```
+
+海外服务器不需要执行前文的 Docker Hub 镜像加速配置。如果服务器的 `/etc/docker/daemon.json` 已配置 `registry-mirrors`，应先删除该项并重启 Docker，才能保证 Docker 基础镜像也直接使用官方仓库。
+
+### 检查启动结果
+
+两个启动版本完成后都使用以下命令检查：
+
 ```bash
 ./manage.sh status
-curl http://127.0.0.1/readyz
+curl http://127.0.0.1:8088/readyz
 ```
 
 正常结果应包含：
@@ -170,12 +191,12 @@ cd /opt/douyin/deploy/centos
 docker compose --env-file .env -f compose.yaml exec api python scripts/create_admin.py
 ```
 
-按提示输入管理员登录名、显示名称和至少 8 位密码，然后访问 `http://你的服务器IP/`。管理员和客户使用同一个登录入口，系统根据角色进入对应后台。
+按提示输入管理员登录名、显示名称和至少 8 位密码，然后访问 `http://你的服务器IP:8088/`。管理员和客户使用同一个登录入口，系统根据角色进入对应后台。
 
-云服务器还需在安全组放行 TCP 80。CentOS 启用了 firewalld 时执行：
+云服务器还需在安全组放行 TCP 8088。CentOS 启用了 firewalld 时执行：
 
 ```bash
-firewall-cmd --permanent --add-service=http
+firewall-cmd --permanent --add-port=8088/tcp
 firewall-cmd --reload
 ```
 
@@ -210,7 +231,11 @@ Chromium 以 `headless=false` 运行，画面由 Xvfb 虚拟屏幕承载，因�
 ./manage.sh logs task-worker       # 评论任务日志
 ./manage.sh restart                # 重启全部服务
 ./manage.sh stop                   # 停止并保留数据
-./manage.sh update                 # 拉取 main 并重新构建
+./manage.sh update                 # 按 .env 中的源拉取 main 并重新构建
+./start-cn.sh                      # 国内镜像重新构建并启动
+./start-cn.sh update               # 更新代码并使用国内镜像重新构建
+./start-global.sh                  # 海外官方源重新构建并启动
+./start-global.sh update           # 更新代码并使用海外官方源重新构建
 ```
 
 Docker 和容器均已配置自动重启。不要执行 `docker compose down -v`，其中 `-v` 会删除 MySQL 和 Redis 数据卷。
@@ -253,7 +278,7 @@ docker compose --env-file .env -f compose.yaml exec -T mysql \
 
 ## 11. HTTPS
 
-当前配置监听 HTTP 80，适合首次测试。正式开放客户登录前，应在云负载均衡、CDN 或独立反向代理上绑定域名和 HTTPS 证书，并转发到服务器 80 端口。保持 `/api/`、`/healthz` 和 `/readyz` 路径不变。
+当前配置监听 HTTP 8088，适合首次测试。正式开放客户登录前，应在云负载均衡、CDN 或独立反向代理上绑定域名和 HTTPS 证书，并转发到服务器 8088 端口。保持 `/api/`、`/healthz` 和 `/readyz` 路径不变。
 
 ## 12. 常见问题
 
@@ -261,8 +286,8 @@ docker compose --env-file .env -f compose.yaml exec -T mysql \
 
 ```bash
 ./manage.sh status
-ss -lntp | grep ':80'
-curl -v http://127.0.0.1/healthz
+ss -lntp | grep ':8088'
+curl -v http://127.0.0.1:8088/healthz
 ```
 
 页面出现 502 时检查 API、MySQL 和 Redis：
@@ -319,7 +344,7 @@ docker compose --env-file .env -f compose.yaml down -v
 
 | 服务 | 作用 | 公网端口 |
 | --- | --- | --- |
-| `web` | Nginx、前端静态文件和 API 反向代理 | 80 |
+| `web` | Nginx、前端静态文件和 API 反向代理 | 8088 |
 | `api` | FastAPI 接口 | 无 |
 | `mysql` | 业务数据和加密后的登录状态 | 无 |
 | `redis` | 队列、浏览器指令和 Worker 心跳 | 无 |
@@ -327,4 +352,4 @@ docker compose --env-file .env -f compose.yaml down -v
 | `browser-worker` | 唤醒、关闭账号浏览器 | 无 |
 | `task-worker` | 进入直播链接并执行评论任务 | 无 |
 
-MySQL 和 Redis 使用 Docker 命名卷持久化，只有 `web` 容器占用宿主机 80 端口。
+MySQL 和 Redis 使用 Docker 命名卷持久化，只有 `web` 容器占用宿主机 8088 端口。
