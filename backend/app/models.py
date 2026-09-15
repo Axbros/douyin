@@ -163,6 +163,7 @@ class CommentLog(TimestampMixin, Base):
     content: Mapped[str] = mapped_column(String(500))
     result: Mapped[str] = mapped_column(String(40))
     failure_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    failure_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
     sensitive_word: Mapped[str | None] = mapped_column(String(255), nullable=True)
     sent_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=3), nullable=True)
 

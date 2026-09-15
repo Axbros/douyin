@@ -256,6 +256,7 @@ CREATE TABLE comment_logs (
     content VARCHAR(500) NOT NULL,
     result VARCHAR(40) NOT NULL COMMENT 'sent/failed/blocked_by_sensitive_word/skipped',
     failure_code VARCHAR(100) NULL,
+    failure_reason VARCHAR(500) NULL,
     sensitive_word VARCHAR(255) NULL,
     platform_request_id VARCHAR(255) NULL,
     sent_at DATETIME(3) NULL,

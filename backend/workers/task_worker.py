@@ -144,6 +144,7 @@ async def run_account(task_id: int, assignment_id: int, account_id: int, live_ur
                     db.add(CommentLog(
                         task_id=task_id, account_id=account_id, live_url=live_url,
                         content=script.content, result="blocked_sensitive", sensitive_word=matched_word,
+                        failure_reason="评论包含敏感内容，已被系统拦截",
                     ))
                     await db.commit()
                 print(f"[TaskWorker] 账号 {account_id} 命中敏感词，跳过评论: {matched_word}", flush=True)
@@ -153,6 +154,7 @@ async def run_account(task_id: int, assignment_id: int, account_id: int, live_ur
                 db.add(CommentLog(
                     task_id=task_id, account_id=account_id, live_url=live_url,
                     content=script.content, result="sent" if ok else "failed",
+                    failure_reason=None if ok else "页面操作未确认评论发送成功",
                     sent_at=datetime.now(),
                 ))
                 await db.commit()

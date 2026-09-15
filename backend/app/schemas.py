@@ -156,6 +156,7 @@ class CommentLogResponse(BaseModel):
     content: str
     result: str
     failure_code: str | None = None
+    failure_reason: str | None = None
     sensitive_word: str | None = None
     sent_at: datetime | None = None
     created_at: datetime
