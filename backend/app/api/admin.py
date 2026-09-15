@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import platform
 import re
@@ -12,12 +13,13 @@ import psutil
 from datetime import datetime, timedelta
 from hashlib import sha256
 from secrets import token_urlsafe
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.database import redis_client
+from app.core.browser_preview import screenshot_request_key, screenshot_response_key
 from app.core.crypto import encrypt_transient_secret
 from app.core.platform_settings import get_platform_settings, update_platform_settings
 from app.core.security import hash_password
@@ -735,6 +737,61 @@ async def login_session_status(session_id: int, user: Annotated[User, Depends(ad
     except (TypeError, ValueError):
         result["selected_verification_method"] = None
     return result
+
+
+async def _request_browser_screenshot(browser_type: str, browser_id: int) -> Response:
+    request_id = token_urlsafe(18)
+    request_key = screenshot_request_key(browser_type, browser_id)
+    response_key = screenshot_response_key(request_id)
+    async with redis_client.pipeline(transaction=True) as pipe:
+        pipe.rpush(request_key, request_id)
+        pipe.expire(request_key, 30)
+        await pipe.execute()
+    item = await redis_client.blpop(response_key, timeout=12)
+    if not item:
+        raise HTTPException(504, "浏览器画面获取超时，请确认浏览器仍在运行")
+    try:
+        payload = json.loads(item[1])
+    except (TypeError, ValueError):
+        raise HTTPException(502, "浏览器返回了无效的截图数据")
+    if not payload.get("ok"):
+        raise HTTPException(502, payload.get("error") or "浏览器截图失败")
+    try:
+        image = base64.b64decode(payload["image"], validate=True)
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(502, "浏览器返回了无效的截图图片")
+    return Response(
+        content=image,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
+
+
+@router.get("/douyin-login-sessions/{session_id}/screenshot")
+async def login_session_screenshot(
+    session_id: int,
+    user: Annotated[User, Depends(admin_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    session = await db.scalar(select(AccountLoginSession).where(
+        AccountLoginSession.id == session_id,
+        AccountLoginSession.deleted_at.is_(None),
+    ))
+    if not session:
+        raise HTTPException(404, "登录会话不存在")
+    return await _request_browser_screenshot("login", session.id)
+
+
+@router.get("/douyin-accounts/{account_id}/browser/screenshot")
+async def account_browser_screenshot(
+    account_id: int,
+    user: Annotated[User, Depends(admin_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    account = await _get_douyin_account(account_id, db)
+    if account.status != "browser_open":
+        raise HTTPException(409, "该账号的调试浏览器没有运行")
+    return await _request_browser_screenshot("account", account.id)
 
 
 @router.post("/douyin-login-sessions/{session_id}/verification-method", status_code=202)

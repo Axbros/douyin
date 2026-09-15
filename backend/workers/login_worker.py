@@ -19,6 +19,7 @@ from sqlalchemy import select
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.core.crypto import decrypt_transient_secret, encrypt_storage_state
+from app.core.browser_preview import answer_screenshot_requests
 from app.core.database import SessionLocal, redis_client
 from app.models import AccountLoginSession, AccountLog, DouyinAccount
 from src.platforms import create_platform
@@ -81,13 +82,15 @@ async def stop_closed_browser(session_id: int, browser, context, playwright):
         pass
 
 
-async def wait_for_manual_close(session_id: int, browser, context, playwright):
+async def wait_for_manual_close(session_id: int, browser, context, playwright, page=None):
     """浏览器保持打开，直到管理员调用接口或直接关闭窗口。"""
     print(f"[LoginWorker] 浏览器保持打开，等待手动关闭，会话 {session_id}", flush=True)
     while True:
         if await browser_window_closed(browser, context):
             await stop_closed_browser(session_id, browser, context, playwright)
             return
+        if page is not None:
+            await answer_screenshot_requests("login", session_id, page)
         if await redis_client.blpop(f"douyin:login:close:{session_id}", timeout=1):
             await close_browser(session_id, browser, context, playwright)
             return
@@ -308,6 +311,8 @@ async def click_verification_button(container) -> bool:
     try:
         selectors = (
             '[class*="verification_component_btn-"]',
+            'button',
+            '[role="button"]',
             'div',
         )
         for selector in selectors:
@@ -327,14 +332,39 @@ async def click_verification_button(container) -> bool:
                         break
                     await asyncio.sleep(0.1)
                 if not clickable:
-                    continue
+                    # 抖音偶尔不会及时移除动态 disabled class，但输入状态已经更新。
+                    # 直接触发 DOM click，让页面自身决定是否可以提交，后续再读取
+                    # 页面明确返回的验证结果。
+                    try:
+                        await button.evaluate("element => element.click()")
+                        print("[LoginWorker] 验证按钮状态未刷新，已直接触发验证", flush=True)
+                        return True
+                    except Exception:
+                        continue
                 try:
                     await button.click(timeout=3000)
                 except Exception:
                     await button.evaluate("element => element.click()")
                 return True
-    except Exception:
-        pass
+        # 标签结构再次变化时，从“验证”文字向上寻找按钮或带 btn class 的容器。
+        labels = container.get_by_text("验证", exact=True)
+        for index in range(await labels.count()):
+            label = labels.nth(index)
+            if not await label.is_visible():
+                continue
+            clickable_ancestor = label.locator(
+                "xpath=ancestor-or-self::*[self::button or @role='button' or "
+                "contains(@class, 'btn')][1]"
+            )
+            target = clickable_ancestor.first if await clickable_ancestor.count() else label
+            await target.evaluate("element => element.click()")
+            print("[LoginWorker] 已通过验证文字触发验证按钮", flush=True)
+            return True
+    except Exception as exc:
+        print(
+            f"[LoginWorker] 定位或点击验证按钮异常: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
     return False
 
 
@@ -362,9 +392,20 @@ async def fill_and_submit_password(container, password: str) -> bool:
             await input_box.press_sequentially(password, delay=35)
         except Exception:
             await input_box.fill(password)
+        await input_box.evaluate(
+            """element => {
+                element.dispatchEvent(new Event('input', { bubbles: true }));
+                element.dispatchEvent(new Event('change', { bubbles: true }));
+                element.blur();
+            }"""
+        )
         await asyncio.sleep(0.3)
         return await click_verification_button(container)
-    except Exception:
+    except Exception as exc:
+        print(
+            f"[LoginWorker] 填写登录密码或提交验证异常: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
         return False
 
 
@@ -405,6 +446,7 @@ async def run_session(session_id: int):
         p = await async_playwright().start()
         browser = None
         context = None
+        page = None
         try:
             # 与原桌面程序一致：默认打开可见浏览器，让管理员直接扫码。
             # Linux 无桌面服务器由 Xvfb 提供虚拟屏幕，仍保持有界面模式以兼容页面行为。
@@ -441,6 +483,7 @@ async def run_session(session_id: int):
                 encoded = ""
                 chosen_area = 0
                 for qr_attempt in range(1, 11):
+                    await answer_screenshot_requests("login", session_id, page)
                     if await redis_client.lpop(f"douyin:login:close:{session_id}"):
                         await close_browser(session_id, browser, context, p)
                         return
@@ -514,6 +557,7 @@ async def run_session(session_id: int):
                 login_candidate_at: float | None = None
                 last_probe_at = asyncio.get_running_loop().time()
                 while datetime.now().timestamp() < deadline:
+                    await answer_screenshot_requests("login", session_id, page)
                     # 扫码等待期间也要响应后台关闭弹窗的操作。
                     close_requested = await redis_client.lpop(f"douyin:login:close:{session_id}")
                     if close_requested:
@@ -759,7 +803,7 @@ async def run_session(session_id: int):
                         await db.commit()
                         await publish(session.id, "success", account_id=account.id)
                         print(f"[LoginWorker] 扫码登录成功，会话 {session_id}", flush=True)
-                        await wait_for_manual_close(session_id, browser, context, p)
+                        await wait_for_manual_close(session_id, browser, context, p, page)
                         account.status = "available" if account.enabled else "disabled"
                         await db.commit()
                         print(f"[LoginWorker] 登录浏览器已关闭，账号 {account.id} 可以分配任务", flush=True)
@@ -773,7 +817,7 @@ async def run_session(session_id: int):
                 await db.commit()
                 await publish(session.id, "expired")
                 print(f"[LoginWorker] 登录会话已过期，会话 {session_id}", flush=True)
-                await wait_for_manual_close(session_id, browser, context, p)
+                await wait_for_manual_close(session_id, browser, context, p, page)
             except Exception as exc:
                 session.status = "failed"
                 session.failure_reason = f"{type(exc).__name__}: {exc}"[:500]
@@ -782,12 +826,12 @@ async def run_session(session_id: int):
                 await db.commit()
                 await publish(session.id, "failed", reason=session.failure_reason)
                 print(f"[LoginWorker] 登录会话失败，会话 {session_id}: {session.failure_reason}", flush=True)
-                await wait_for_manual_close(session_id, browser, context, p)
+                await wait_for_manual_close(session_id, browser, context, p, page)
         except Exception:
             if browser:
                 print(f"[LoginWorker] Worker 内部异常，会话 {session_id}，浏览器仍保持打开", flush=True)
                 # 发生未预期异常时也保留浏览器，便于管理员检查页面并手动结束会话。
-                await wait_for_manual_close(session_id, browser, context, p)
+                await wait_for_manual_close(session_id, browser, context, p, page)
             else:
                 # Chromium 尚未启动时没有可保留的浏览器，释放 Playwright 驱动。
                 await p.stop()

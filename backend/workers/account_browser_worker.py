@@ -8,6 +8,7 @@ from playwright.async_api import async_playwright
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.core.crypto import decrypt_storage_state
+from app.core.browser_preview import answer_screenshot_requests
 from app.core.database import SessionLocal, redis_client
 from app.models import AccountLog, DouyinAccount
 from src.platforms import create_platform
@@ -52,8 +53,10 @@ async def run_account_browser(account_id: int, active: set[int]):
             await db.commit()
             opened = True
         print(f"[AccountBrowserWorker] 账号 {account_id} 浏览器已唤醒，已恢复登录状态", flush=True)
-        while not await redis_client.blpop(f"douyin:account-browser:close:{account_id}", timeout=5):
-            pass
+        while True:
+            await answer_screenshot_requests("account", account_id, page)
+            if await redis_client.blpop(f"douyin:account-browser:close:{account_id}", timeout=1):
+                break
     except Exception as exc:
         failed = True
         print(f"[AccountBrowserWorker] 账号 {account_id} 启动失败: {type(exc).__name__}: {exc}", flush=True)
