@@ -310,6 +310,44 @@ async def find_login_password_context(page, context=None):
     return None, None
 
 
+async def trigger_and_confirm_click(button) -> str | None:
+    """点击目标节点并确认 click 事件确实到达；返回实际触发方式。"""
+    marker = "data-codex-click-seen"
+    try:
+        await button.evaluate(
+            """(element, marker) => {
+                element.setAttribute(marker, '0');
+                element.addEventListener('click', () => {
+                    element.setAttribute(marker, '1');
+                }, { capture: true, once: true });
+            }""",
+            marker,
+        )
+        try:
+            # force 可跳过服务端虚拟屏幕上偶发的透明遮罩拦截检查。
+            await button.click(timeout=3000, force=True)
+        except Exception:
+            pass
+        try:
+            if await button.get_attribute(marker) == "1":
+                await button.evaluate("(element, marker) => element.removeAttribute(marker)", marker)
+                return "mouse"
+        except Exception:
+            # 点击导致面板卸载或页面跳转，也表示提交动作已经触发。
+            return "mouse"
+        try:
+            await button.evaluate("element => element.click()")
+            if await button.get_attribute(marker) == "1":
+                await button.evaluate("(element, marker) => element.removeAttribute(marker)", marker)
+                return "dom"
+        except Exception:
+            # DOM click 后节点被卸载，同样视为已触发。
+            return "dom"
+    except Exception:
+        return None
+    return None
+
+
 async def click_verification_button(container, input_box=None) -> bool:
     try:
         if input_box is not None:
@@ -341,15 +379,17 @@ async def click_verification_button(container, input_box=None) -> bool:
                             break
                         await asyncio.sleep(0.1)
                     try:
-                        if "disabled-" in class_name:
-                            await button.evaluate("element => element.click()")
+                        click_method = await trigger_and_confirm_click(button)
+                        if click_method:
+                            state = "disabled" if "disabled-" in class_name else "enabled"
+                            method_text = "鼠标点击" if click_method == "mouse" else "DOM 点击"
                             print(
-                                "[LoginWorker] 验证按钮仍为 disabled，已按精确 XPath直接触发",
+                                f"[LoginWorker] 已按精确 XPath触发验证点击事件: "
+                                f"state={state}, method={method_text}",
                                 flush=True,
                             )
                         else:
-                            await button.click(timeout=3000)
-                            print("[LoginWorker] 已按精确 XPath点击验证按钮", flush=True)
+                            raise RuntimeError("目标节点没有收到 click 事件")
                         return True
                     except Exception as exc:
                         print(
@@ -466,7 +506,8 @@ async def fill_and_submit_password(container, password: str, input_box=None) -> 
         if input_box is None:
             print("[LoginWorker] 未找到二次认证登录密码输入框", flush=True)
             return False
-        await input_box.click(timeout=3000)
+        # 直接聚焦输入框，不依赖鼠标坐标，避免虚拟屏幕上的透明遮罩拦截。
+        await input_box.focus(timeout=3000)
         await input_box.fill("")
         # 优先模拟真实键盘输入，让抖音的 React 表单同步密码状态并解除按钮禁用。
         await input_box.press_sequentially(password, delay=35)
