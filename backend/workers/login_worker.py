@@ -225,7 +225,25 @@ async def verification_methods(container) -> list[dict[str, str | None]]:
     return options
 
 
-async def click_verification_method(container, method_id: str) -> bool:
+async def click_verification_method(container, method_id: str, label: str | None = None) -> bool:
+    # 优先点击管理员实际选择的文字。抖音的 React 点击事件绑定在列表项上，
+    # 从文字节点触发原生 click 会冒泡到列表项，同时避开透明遮罩和动态 class。
+    if label:
+        try:
+            label_candidates = container.get_by_text(label, exact=True)
+            for index in range(await label_candidates.count()):
+                label_item = label_candidates.nth(index)
+                if not await label_item.is_visible():
+                    continue
+                list_item = label_item.locator(
+                    'xpath=ancestor::*[contains(@class, "verification_component_list_item-")][1]'
+                )
+                target = list_item.first if await list_item.count() else label_item
+                await target.evaluate("element => element.click()")
+                return True
+        except Exception:
+            pass
+
     candidate = container.locator(f'[data-login-method-id="{method_id}"]')
     if not await candidate.count():
         return False
@@ -494,7 +512,11 @@ async def run_session(session_id: int):
                                 selected_id = await redis_client.lpop(f"douyin:login:verification-method:{session_id}")
                                 selected = next((item for item in methods if item["id"] == selected_id), None)
                                 if selected:
-                                    if await click_verification_method(second_verify, str(selected["id"])):
+                                    if await click_verification_method(
+                                        second_verify,
+                                        str(selected["id"]),
+                                        str(selected["label"]),
+                                    ):
                                         selected_method = selected
                                         method_clicked_at = asyncio.get_running_loop().time()
                                         session.status = "method_processing"
@@ -519,7 +541,7 @@ async def run_session(session_id: int):
                                 and methods
                                 and current_signature == method_signature
                                 and method_clicked_at is not None
-                                and asyncio.get_running_loop().time() - method_clicked_at >= 5
+                                and asyncio.get_running_loop().time() - method_clicked_at >= 12
                             ):
                                 selected_method = None
                                 method_clicked_at = None

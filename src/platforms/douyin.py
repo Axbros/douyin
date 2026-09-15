@@ -169,7 +169,15 @@ class DouyinPlatform(Platform):
             try:
                 candidates = page.locator(selector)
                 for index in range(await candidates.count()):
-                    if await candidates.nth(index).is_visible():
+                    candidate = candidates.nth(index)
+                    if await candidate.is_visible():
+                        return True
+                    # 抖音部分弹层根节点自身没有尺寸，但内部内容可见并会拦截点击。
+                    # 仅用根节点 is_visible() 会误判弹层尚未打开。
+                    visible_children = candidate.locator(
+                        'div:visible, img:visible, input:visible, button:visible, p:visible'
+                    )
+                    if await visible_children.count():
                         return True
             except Exception:
                 continue
