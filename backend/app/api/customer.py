@@ -177,7 +177,7 @@ async def bulk_create_scripts(payload: ScriptBulkCreate, user: Annotated[User, D
         title=f"导入话术 {index + 1}",
         content=content,
         weight=1,
-        status="draft",
+        status="pending_review",
     ) for index, content in enumerate(contents)]
     db.add_all(scripts)
     await db.commit()
