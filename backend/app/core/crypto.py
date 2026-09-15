@@ -19,5 +19,18 @@ def encrypt_storage_state(state: dict) -> bytes:
     return storage_cipher().encrypt(json.dumps(state, ensure_ascii=False).encode())
 
 
+def decrypt_storage_state(payload: bytes) -> dict:
+    import json
+    return json.loads(storage_cipher().decrypt(payload).decode())
+
+
+def encrypt_transient_secret(value: str) -> str:
+    return storage_cipher().encrypt(value.encode()).decode()
+
+
+def decrypt_transient_secret(payload: str) -> str:
+    return storage_cipher().decrypt(payload.encode()).decode()
+
+
 def generate_fernet_key() -> str:
     return Fernet.generate_key().decode()

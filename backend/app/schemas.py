@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class LoginRequest(BaseModel):
@@ -8,11 +8,50 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=8)
 
 
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=8)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
 class UserResponse(BaseModel):
     id: int
     role: str
     login: str
     display_name: str
+    status: str
+    expires_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class AdminCustomerCreate(BaseModel):
+    login: str = Field(min_length=3, max_length=190)
+    display_name: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=8, max_length=128)
+
+
+class AdminCustomerUpdate(BaseModel):
+    login: str | None = Field(default=None, min_length=3, max_length=190)
+    display_name: str | None = Field(default=None, min_length=1, max_length=100)
+
+
+class AdminCustomerStatusUpdate(BaseModel):
+    status: str = Field(pattern="^(active|disabled)$")
+
+
+class AdminCustomerPasswordReset(BaseModel):
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+class AdminCustomerResponse(BaseModel):
+    id: int
+    login: str
+    display_name: str
+    status: str
+    last_login_at: datetime | None = None
+    expires_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
 
     model_config = {"from_attributes": True}
 
@@ -29,6 +68,10 @@ class ScriptCreate(BaseModel):
     weight: int = Field(default=1, ge=1, le=100)
 
 
+class ScriptBulkCreate(BaseModel):
+    contents: list[str] = Field(min_length=1, max_length=1000)
+
+
 class ScriptResponse(ScriptCreate):
     id: int
     status: str
@@ -37,21 +80,84 @@ class ScriptResponse(ScriptCreate):
     model_config = {"from_attributes": True}
 
 
+class AdminScriptResponse(BaseModel):
+    id: int
+    customer_id: int
+    customer_login: str
+    customer_name: str
+    title: str
+    content: str
+    weight: int
+    status: str
+    review_reason: str | None = None
+    created_at: datetime
+    reviewed_at: datetime | None = None
+
+
 class TaskCreate(BaseModel):
     room_id: str = Field(min_length=1, max_length=100)
     script_ids: list[int] = Field(min_length=1)
-    target_account_count: int = Field(default=3, ge=1, le=100)
     min_interval_seconds: int = Field(default=20, ge=5, le=3600)
     max_interval_seconds: int = Field(default=50, ge=5, le=3600)
 
 
 class TaskResponse(BaseModel):
     id: int
+    customer_id: int
     room_id: str
     status: str
     target_account_count: int
     min_interval_seconds: int
     max_interval_seconds: int
+    started_at: datetime | None = None
+    paused_at: datetime | None = None
+    stopped_at: datetime | None = None
+    failure_reason: str | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class CommentLogResponse(BaseModel):
+    id: int
+    task_id: int
+    account_id: int
+    room_id: str
+    content: str
+    result: str
+    failure_code: str | None = None
+    sensitive_word: str | None = None
+    sent_at: datetime | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class TaskAccountResponse(BaseModel):
+    id: int
+    task_id: int
+    account_id: int
+    status: str
+    assigned_at: datetime
+    removed_at: datetime | None = None
+    last_error: str | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class SensitiveWordCreate(BaseModel):
+    word: str = Field(min_length=1, max_length=255)
+    match_type: str = Field(default="contains", pattern="^(contains|exact|regex)$")
+
+
+class SensitiveWordUpdate(BaseModel):
+    word: str | None = Field(default=None, min_length=1, max_length=255)
+    match_type: str | None = Field(default=None, pattern="^(contains|exact|regex)$")
+
+
+class SensitiveWordResponse(SensitiveWordCreate):
+    id: int
+    enabled: bool
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -68,8 +174,31 @@ class AccountResponse(BaseModel):
     current_worker_id: int | None = None
     risk_code: str | None = None
     risk_message: str | None = None
+    last_error: str | None = None
+    created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class DouyinAccountUpdate(BaseModel):
+    display_name: str = Field(min_length=1, max_length=100)
+
+
+class AccountLogResponse(BaseModel):
+    id: int
+    account_id: int
+    worker_id: int | None = None
+    event_type: str
+    detail: dict | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class LoginVerificationOption(BaseModel):
+    id: str
+    label: str
+    description: str | None = None
 
 
 class LoginSessionResponse(BaseModel):
@@ -78,5 +207,77 @@ class LoginSessionResponse(BaseModel):
     status: str
     expires_at: datetime
     qr_payload: str | None = None
+    failure_reason: str | None = None
+    verification_options: list[LoginVerificationOption] = Field(default_factory=list)
+    selected_verification_method: LoginVerificationOption | None = None
 
     model_config = {"from_attributes": True}
+
+
+class LoginVerificationCodeRequest(BaseModel):
+    code: str = Field(pattern=r"^\d{6}$")
+
+
+class LoginPasswordRequest(BaseModel):
+    password: str = Field(min_length=1, max_length=50)
+
+
+class LoginVerificationMethodRequest(BaseModel):
+    method_id: str = Field(pattern=r"^method-\d+$")
+
+
+class ServiceStatus(BaseModel):
+    name: str
+    status: str
+    latency_ms: float | None = None
+    last_heartbeat_at: datetime | None = None
+
+
+class ServerStatusResponse(BaseModel):
+    collected_at: datetime
+    hostname: str
+    platform: str
+    python_version: str
+    uptime_seconds: int
+    cpu_percent: float
+    cpu_count: int
+    load_average: list[float]
+    memory_total: int
+    memory_used: int
+    memory_percent: float
+    disk_total: int
+    disk_used: int
+    disk_percent: float
+    services: list[ServiceStatus]
+
+
+class PlatformSettingsResponse(BaseModel):
+    default_target_account_count: int
+    max_active_tasks_per_customer: int
+    comment_min_interval_seconds: int
+    comment_max_interval_seconds: int
+    max_scripts_per_task: int
+    script_bulk_import_limit: int
+    qr_expire_minutes: int
+    worker_heartbeat_timeout_seconds: int
+    account_reclaim_seconds: int
+
+
+class PlatformSettingsUpdate(PlatformSettingsResponse):
+    default_target_account_count: int = Field(ge=1, le=100)
+    max_active_tasks_per_customer: int = Field(ge=1, le=20)
+    comment_min_interval_seconds: int = Field(ge=5, le=3600)
+    comment_max_interval_seconds: int = Field(ge=5, le=3600)
+    max_scripts_per_task: int = Field(ge=1, le=500)
+    script_bulk_import_limit: int = Field(ge=1, le=1000)
+    qr_expire_minutes: int = Field(ge=1, le=30)
+    worker_heartbeat_timeout_seconds: int = Field(ge=10, le=300)
+    account_reclaim_seconds: int = Field(ge=30, le=1800)
+
+    @model_validator(mode="after")
+    def validate_ranges(self):
+        if self.comment_max_interval_seconds < self.comment_min_interval_seconds:
+            raise ValueError("评论最大间隔不能小于最小间隔")
+        if self.account_reclaim_seconds < self.worker_heartbeat_timeout_seconds:
+            raise ValueError("账号回收时间不能小于 Worker 心跳超时")
+        return self

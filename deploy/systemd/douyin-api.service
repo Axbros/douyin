@@ -1,0 +1,23 @@
+[Unit]
+Description=Douyin Platform FastAPI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=douyin
+Group=douyin
+WorkingDirectory=/opt/douyin/backend
+EnvironmentFile=/opt/douyin/backend/.env
+Environment=PYTHONPATH=/opt/douyin/backend:/opt/douyin
+ExecStart=/opt/douyin/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+KillMode=control-group
+LogsDirectory=douyin
+StandardOutput=append:/var/log/douyin/api.log
+StandardError=append:/var/log/douyin/api.log
+
+[Install]
+WantedBy=multi-user.target

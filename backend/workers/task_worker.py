@@ -1,0 +1,286 @@
+"""抖音任务执行 Worker：进入直播间并按审核话术发送评论。"""
+import asyncio
+import os
+import random
+import re
+import sys
+from datetime import datetime
+
+from playwright.async_api import async_playwright
+from sqlalchemy import select
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from app.core.crypto import decrypt_storage_state
+from app.core.database import SessionLocal, redis_client
+from app.core.worker_registry import heartbeat_worker, mark_worker_offline, register_worker
+from app.models import AccountLog, CommentLog, DouyinAccount, Script, SensitiveWord, Task, TaskAccount, TaskScript
+from src.sender import CommentSender
+
+WORKER_HEARTBEAT_KEY = "douyin:task-worker:heartbeat"
+WORKER_HEARTBEAT_TTL_SECONDS = 300
+
+
+class LoginStateExpired(RuntimeError):
+    pass
+
+
+async def heartbeat(worker_id: int):
+    while True:
+        try:
+            await redis_client.set(WORKER_HEARTBEAT_KEY, datetime.now().isoformat(), ex=WORKER_HEARTBEAT_TTL_SECONDS)
+            await heartbeat_worker(worker_id)
+        except Exception:
+            pass
+        await asyncio.sleep(5)
+
+
+async def wait_for_assignment_stop(assignment_id: int, seconds: float) -> bool:
+    """等待评论间隔，同时让移除账号/停止任务最多 2 秒内生效。"""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + seconds
+    while loop.time() < deadline:
+        if await redis_client.lpop(f"douyin:task-account:stop:{assignment_id}"):
+            return True
+        await asyncio.sleep(min(2, max(0, deadline - loop.time())))
+    return bool(await redis_client.lpop(f"douyin:task-account:stop:{assignment_id}"))
+
+
+def find_sensitive_word(content: str, words):
+    for item in words:
+        try:
+            if item.match_type == "exact" and content == item.word:
+                return item.word
+            if item.match_type == "contains" and item.word in content:
+                return item.word
+            if item.match_type == "regex" and re.search(item.word, content):
+                return item.word
+        except re.error:
+            print(f"[TaskWorker] 忽略无效敏感词正则: {item.word}", flush=True)
+    return None
+from src.platforms import create_platform
+
+
+async def run_account(task_id: int, assignment_id: int, account_id: int, room_id: str, worker_id: int):
+    platform = create_platform("douyin")
+    playwright = browser = context = None
+    failed = False
+    login_expired = False
+    claimed = False
+    try:
+        async with SessionLocal() as db:
+            account = await db.get(DouyinAccount, account_id)
+            assignment = await db.scalar(select(TaskAccount).where(TaskAccount.id == assignment_id).with_for_update())
+            if not account or not assignment or assignment.status != "assigned" or not account.encrypted_storage_state:
+                return
+            assignment.status = "running"
+            account.current_worker_id = worker_id
+            await db.commit()
+            claimed = True
+            state = decrypt_storage_state(account.encrypted_storage_state)
+        playwright = await async_playwright().start()
+        browser = await playwright.chromium.launch(headless=os.getenv("PLAYWRIGHT_HEADLESS", "false").lower() == "true")
+        context = await browser.new_context(storage_state=state)
+        page = await context.new_page()
+        await page.goto(f"{platform.home_url}/{room_id}", wait_until="domcontentloaded", timeout=30000)
+        if not await platform.check_logged_in(page, context):
+            raise LoginStateExpired("登录状态已失效，请重新扫码登录")
+        async with SessionLocal() as db:
+            db.add(AccountLog(account_id=account_id, event_type="task_browser_started", detail={"task_id": task_id, "room_id": room_id}))
+            await db.commit()
+        print(f"[TaskWorker] 账号 {account_id} 已进入直播间 {room_id}，任务 {task_id}", flush=True)
+        async with SessionLocal() as db:
+            scripts = list(await db.scalars(select(Script).join(
+                TaskScript, TaskScript.script_id == Script.id
+            ).where(
+                TaskScript.task_id == task_id, Script.status == "approved",
+                Script.deleted_at.is_(None), TaskScript.deleted_at.is_(None),
+            )))
+            sensitive_words = list(await db.scalars(select(SensitiveWord).where(
+                SensitiveWord.enabled.is_(True), SensitiveWord.deleted_at.is_(None)
+            )))
+        sender = CommentSender(page, {
+            "min_interval": 1,
+            "max_interval": 1,
+            "max_length": 500,
+        }, platform=platform)
+        while True:
+            async with SessionLocal() as db:
+                task = await db.get(Task, task_id)
+                if not task or task.status in {"stopped", "failed", "completed"}:
+                    break
+                task_status = task.status
+                min_interval, max_interval = task.min_interval_seconds, task.max_interval_seconds
+                account_row = await db.get(DouyinAccount, account_id)
+                if account_row:
+                    account_row.last_heartbeat_at = datetime.now()
+                    account_row.status = "paused" if task_status == "paused" else "busy"
+                    await db.commit()
+            if task_status == "paused" or not scripts:
+                await asyncio.sleep(2)
+                continue
+            interrupted = await wait_for_assignment_stop(
+                assignment_id, random.uniform(min_interval, max_interval)
+            )
+            if interrupted:
+                break
+            # 休眠期间可能被暂停、停止或由管理员移除，发送前必须再次确认。
+            async with SessionLocal() as db:
+                task = await db.get(Task, task_id)
+                assignment = await db.get(TaskAccount, assignment_id)
+                if not task or task.status in {"stopped", "failed", "completed"}:
+                    break
+                if not assignment or assignment.status in {"removed", "completed", "error"}:
+                    break
+                if task.status == "paused":
+                    continue
+            script = random.choices(scripts, weights=[max(1, s.weight) for s in scripts], k=1)[0]
+            matched_word = find_sensitive_word(script.content, sensitive_words)
+            if matched_word:
+                async with SessionLocal() as db:
+                    db.add(CommentLog(
+                        task_id=task_id, account_id=account_id, room_id=room_id,
+                        content=script.content, result="blocked_sensitive", sensitive_word=matched_word,
+                    ))
+                    await db.commit()
+                print(f"[TaskWorker] 账号 {account_id} 命中敏感词，跳过评论: {matched_word}", flush=True)
+                continue
+            ok = await sender.send_comment(script.content)
+            async with SessionLocal() as db:
+                db.add(CommentLog(
+                    task_id=task_id, account_id=account_id, room_id=room_id,
+                    content=script.content, result="sent" if ok else "failed",
+                    sent_at=datetime.now(),
+                ))
+                await db.commit()
+            print(f"[TaskWorker] 账号 {account_id} 评论{'成功' if ok else '失败'}: {script.content}", flush=True)
+    except Exception as exc:
+        failed = True
+        login_expired = isinstance(exc, LoginStateExpired)
+        print(f"[TaskWorker] 账号 {account_id} 执行异常: {type(exc).__name__}: {exc}", flush=True)
+        async with SessionLocal() as db:
+            assignment = await db.get(TaskAccount, assignment_id)
+            if assignment:
+                assignment.status = "error"
+                assignment.last_error = f"{type(exc).__name__}: {exc}"[:1000]
+            account = await db.get(DouyinAccount, account_id)
+            if account:
+                account.last_error = f"{type(exc).__name__}: {exc}"[:1000]
+                account.status = "unlogged" if login_expired else "error"
+                if login_expired:
+                    account.encrypted_storage_state = None
+                db.add(AccountLog(account_id=account_id, event_type="login_expired" if login_expired else "task_error", detail={"task_id": task_id, "reason": account.last_error}))
+            await db.commit()
+    finally:
+        if context:
+            try:
+                await context.close()
+            except Exception:
+                pass
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        if playwright:
+            try:
+                await playwright.stop()
+            except Exception:
+                pass
+        if claimed:
+            async with SessionLocal() as db:
+                assignment = await db.get(TaskAccount, assignment_id)
+                if assignment and assignment.status == "running":
+                    assignment.status = "completed"
+                account = await db.get(DouyinAccount, account_id)
+                if account and account.current_task_id == task_id:
+                    account.current_task_id = None
+                    account.current_worker_id = None
+                    if not failed:
+                        account.status = "available" if account.enabled else "disabled"
+                    db.add(AccountLog(account_id=account_id, event_type="task_browser_stopped", detail={"task_id": task_id, "failed": failed}))
+                await db.commit()
+
+
+async def run_task(task_id: int, worker_id: int):
+    async with SessionLocal() as db:
+        task = await db.get(Task, task_id)
+        if not task or task.status != "pending":
+            return
+        assignments = list(await db.scalars(select(TaskAccount).where(
+            TaskAccount.task_id == task_id,
+            TaskAccount.status == "assigned",
+            TaskAccount.deleted_at.is_(None),
+        )))
+        task.status = "running"
+        task.started_at = datetime.now()
+        await db.commit()
+    await asyncio.gather(*(
+        run_account(task_id, a.id, a.account_id, task.room_id, worker_id) for a in assignments
+    ))
+    async with SessionLocal() as db:
+        task = await db.get(Task, task_id)
+        if task and task.status in {"running", "paused"}:
+            active_count = await db.scalar(select(TaskAccount.id).where(
+                TaskAccount.task_id == task_id,
+                TaskAccount.status.in_(("assigned", "running")),
+                TaskAccount.deleted_at.is_(None),
+            ).limit(1))
+            error_count = await db.scalar(select(TaskAccount.id).where(
+                TaskAccount.task_id == task_id,
+                TaskAccount.status == "error",
+                TaskAccount.deleted_at.is_(None),
+            ).limit(1))
+            if not active_count and error_count:
+                task.status = "failed"
+                task.failure_reason = "所有执行账号均已异常停止"
+                await db.commit()
+
+
+async def run_added_assignment(assignment_id: int, worker_id: int):
+    async with SessionLocal() as db:
+        assignment = await db.get(TaskAccount, assignment_id)
+        if not assignment or assignment.status != "assigned":
+            return
+        task = await db.get(Task, assignment.task_id)
+        if not task or task.status not in {"running", "paused"}:
+            return
+        arguments = (task.id, assignment.id, assignment.account_id, task.room_id)
+    await run_account(*arguments, worker_id)
+
+
+async def main():
+    print("[TaskWorker] 已启动，等待任务...", flush=True)
+    await redis_client.ping()
+    worker_id, worker_key = await register_worker("task")
+    print(f"[TaskWorker] 已注册实例: {worker_key}", flush=True)
+    heartbeat_task = asyncio.create_task(heartbeat(worker_id))
+    running_jobs: set[asyncio.Task] = set()
+    def job_finished(job: asyncio.Task):
+        running_jobs.discard(job)
+        if job.cancelled():
+            return
+        error = job.exception()
+        if error:
+            print(f"[TaskWorker] 后台任务异常: {type(error).__name__}: {error}", flush=True)
+    try:
+        while True:
+            item = await redis_client.blpop(["douyin:tasks", "douyin:task-accounts"], timeout=5)
+            if item:
+                queue_name = item[0].decode() if isinstance(item[0], bytes) else item[0]
+                item_id = int(item[1])
+                coroutine = run_task(item_id, worker_id) if queue_name == "douyin:tasks" else run_added_assignment(item_id, worker_id)
+                job = asyncio.create_task(coroutine)
+                running_jobs.add(job)
+                job.add_done_callback(job_finished)
+    finally:
+        heartbeat_task.cancel()
+        await asyncio.gather(heartbeat_task, return_exceptions=True)
+        for job in running_jobs:
+            job.cancel()
+        await asyncio.gather(*running_jobs, return_exceptions=True)
+        await redis_client.delete(WORKER_HEARTBEAT_KEY)
+        await mark_worker_offline(worker_id)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

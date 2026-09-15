@@ -15,6 +15,7 @@ CREATE TABLE users (
     display_name VARCHAR(100) NOT NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'active' COMMENT 'active/disabled',
     last_login_at DATETIME(3) NULL,
+    expires_at DATETIME(3) NULL COMMENT '客户服务到期时间，管理员为空',
     created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
     deleted_at DATETIME(3) NULL,
@@ -81,7 +82,7 @@ CREATE TABLE account_login_sessions (
     created_by BIGINT UNSIGNED NOT NULL,
     session_token_hash CHAR(64) NOT NULL,
     qr_payload MEDIUMTEXT NULL,
-    status VARCHAR(20) NOT NULL DEFAULT 'waiting' COMMENT 'waiting/scanned/success/expired/failed/cancelled',
+    status VARCHAR(20) NOT NULL DEFAULT 'waiting' COMMENT 'waiting/method_required/method_processing/password_required/password_verifying/verify_required/verifying/success/expired/failed/cancelled',
     expires_at DATETIME(3) NOT NULL,
     scanned_at DATETIME(3) NULL,
     completed_at DATETIME(3) NULL,
@@ -256,4 +257,13 @@ CREATE TABLE system_settings (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 INSERT INTO system_settings (setting_key, setting_value)
-VALUES ('task.default_target_account_count', JSON_OBJECT('value', 3));
+VALUES
+    ('task.default_target_account_count', JSON_OBJECT('value', 3)),
+    ('platform.max_active_tasks_per_customer', JSON_OBJECT('value', 1)),
+    ('platform.comment_min_interval_seconds', JSON_OBJECT('value', 5)),
+    ('platform.comment_max_interval_seconds', JSON_OBJECT('value', 3600)),
+    ('platform.max_scripts_per_task', JSON_OBJECT('value', 100)),
+    ('platform.script_bulk_import_limit', JSON_OBJECT('value', 200)),
+    ('platform.qr_expire_minutes', JSON_OBJECT('value', 5)),
+    ('platform.worker_heartbeat_timeout_seconds', JSON_OBJECT('value', 20)),
+    ('platform.account_reclaim_seconds', JSON_OBJECT('value', 60));

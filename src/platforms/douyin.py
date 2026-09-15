@@ -151,14 +151,14 @@ class DouyinPlatform(Platform):
                     );
                     if (loginBtn && loginBtn.offsetParent !== null) return false;
                     // 兜底：检查 cookie 中是否有非 HttpOnly 的登录态字段
-                    return document.cookie.includes('LOGIN_STATUS') ||
-                           document.cookie.includes('passport_csrf_token');
+                    // passport_csrf_token 未登录时也可能存在，不能作为登录成功依据。
+                    return document.cookie.includes('LOGIN_STATUS');
                 }
             """)
         except Exception:
             return False
 
-    async def click_login_button(self, page) -> bool:
+    async def click_login_button(self, page, log_missing: bool = True) -> bool:
         """打开登录面板。
 
         抖音前端的 CSS class/id 可能每次发布都变化，因此优先使用可访问名称和
@@ -180,7 +180,8 @@ class DouyinPlatform(Platform):
                         return True
             except Exception as exc:
                 print(f"[DouyinPlatform] 登录按钮候选定位失败: {type(exc).__name__}: {exc}", flush=True)
-        print("[DouyinPlatform] 未找到可点击的登录按钮，继续等待页面", flush=True)
+        if log_missing:
+            print("[DouyinPlatform] 未找到可点击的登录按钮，继续等待页面", flush=True)
         return False
 
     def parse_danmu_payload(self, data: bytes) -> list[tuple[str, str]]:

@@ -1,0 +1,25 @@
+[Unit]
+Description=Douyin Account Browser Worker
+After=network-online.target douyin-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=douyin
+Group=douyin
+WorkingDirectory=/opt/douyin
+EnvironmentFile=/opt/douyin/backend/.env
+Environment=PYTHONPATH=/opt/douyin/backend:/opt/douyin
+Environment=PLAYWRIGHT_HEADLESS=false
+Environment=WORKER_INSTANCE_ID=browser
+ExecStart=/usr/bin/xvfb-run -a -s "-screen 0 1280x900x24 -nolisten tcp" /opt/douyin/backend/.venv/bin/python /opt/douyin/backend/workers/account_browser_worker.py
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+KillMode=control-group
+LogsDirectory=douyin
+StandardOutput=append:/var/log/douyin/browser-worker.log
+StandardError=append:/var/log/douyin/browser-worker.log
+
+[Install]
+WantedBy=multi-user.target

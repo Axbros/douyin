@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, status
@@ -26,6 +27,8 @@ async def current_user(
     user = await db.scalar(select(User).where(User.id == user_id, User.deleted_at.is_(None)))
     if not user or user.status != "active":
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="账号不可用")
+    if user.role == "customer" and (user.expires_at is None or user.expires_at <= datetime.now()):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="客户服务已到期")
     return user
 
 

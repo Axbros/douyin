@@ -2,15 +2,21 @@ from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db
+from app.core.database import get_db, redis_client
+from app.core.platform_settings import get_platform_settings
 from app.dependencies import customer_user
-from app.models import Script, Task, TaskScript, User
-from app.schemas import ScriptCreate, ScriptResponse, TaskCreate, TaskResponse
+from app.models import CommentLog, DouyinAccount, Script, Task, TaskAccount, TaskScript, User
+from app.schemas import CommentLogResponse, PlatformSettingsResponse, ScriptBulkCreate, ScriptCreate, ScriptResponse, TaskAccountResponse, TaskCreate, TaskResponse
 
 router = APIRouter(prefix="/api/customer", tags=["customer"])
+
+
+@router.get("/platform-settings", response_model=PlatformSettingsResponse)
+async def customer_platform_settings(user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    return await get_platform_settings(db)
 
 
 @router.get("/scripts", response_model=list[ScriptResponse])
@@ -26,6 +32,30 @@ async def create_script(payload: ScriptCreate, user: Annotated[User, Depends(cus
     await db.commit()
     await db.refresh(script)
     return script
+
+
+@router.post("/scripts/bulk", response_model=list[ScriptResponse], status_code=201)
+async def bulk_create_scripts(payload: ScriptBulkCreate, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    platform_settings = await get_platform_settings(db)
+    contents = [content.strip() for content in payload.contents if content.strip()]
+    if not contents:
+        raise HTTPException(422, "没有可导入的话术")
+    if any(len(content) > 500 for content in contents):
+        raise HTTPException(422, "单条话术不能超过 500 字")
+    if len(contents) > platform_settings["script_bulk_import_limit"]:
+        raise HTTPException(422, f"单次最多导入 {platform_settings['script_bulk_import_limit']} 条话术")
+    scripts = [Script(
+        customer_id=user.id,
+        title=f"导入话术 {index + 1}",
+        content=content,
+        weight=1,
+        status="draft",
+    ) for index, content in enumerate(contents)]
+    db.add_all(scripts)
+    await db.commit()
+    for script in scripts:
+        await db.refresh(script)
+    return scripts
 
 
 @router.post("/scripts/{script_id}/submit-review", response_model=ScriptResponse)
@@ -44,21 +74,50 @@ async def submit_review(script_id: int, user: Annotated[User, Depends(customer_u
 
 @router.post("/tasks", response_model=TaskResponse, status_code=201)
 async def create_task(payload: TaskCreate, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    platform_settings = await get_platform_settings(db)
+    # 锁定客户行，避免同一客户并发请求同时创建多个活动任务。
+    await db.scalar(select(User).where(User.id == user.id).with_for_update())
+    active_task_count = await db.scalar(select(func.count(Task.id)).where(
+        Task.customer_id == user.id,
+        Task.status.in_(("pending", "running", "paused")),
+        Task.deleted_at.is_(None),
+    ))
+    if active_task_count >= platform_settings["max_active_tasks_per_customer"]:
+        raise HTTPException(409, f"当前活动任务已达到上限（{platform_settings['max_active_tasks_per_customer']} 个）")
     if payload.max_interval_seconds < payload.min_interval_seconds:
         raise HTTPException(422, "最大间隔不能小于最小间隔")
+    if payload.min_interval_seconds < platform_settings["comment_min_interval_seconds"] or payload.max_interval_seconds > platform_settings["comment_max_interval_seconds"]:
+        raise HTTPException(422, f"评论间隔必须在 {platform_settings['comment_min_interval_seconds']}–{platform_settings['comment_max_interval_seconds']} 秒之间")
+    if len(set(payload.script_ids)) != len(payload.script_ids):
+        raise HTTPException(422, "话术不能重复选择")
+    if len(payload.script_ids) > platform_settings["max_scripts_per_task"]:
+        raise HTTPException(422, f"单个任务最多选择 {platform_settings['max_scripts_per_task']} 条话术")
     scripts = list(await db.scalars(select(Script).where(
         Script.id.in_(payload.script_ids), Script.customer_id == user.id,
         Script.status == "approved", Script.deleted_at.is_(None),
     )))
     if len(scripts) != len(set(payload.script_ids)):
         raise HTTPException(409, "只能使用审核通过且属于自己的话术")
-    task = Task(customer_id=user.id, room_id=payload.room_id, target_account_count=payload.target_account_count,
+    # 锁定可用账号，避免不同客户并发创建任务时抢到同一个账号。
+    target_account_count = platform_settings["default_target_account_count"]
+    accounts = list(await db.scalars(select(DouyinAccount).where(
+        DouyinAccount.enabled.is_(True), DouyinAccount.status == "available",
+        DouyinAccount.current_task_id.is_(None), DouyinAccount.deleted_at.is_(None),
+    ).order_by(func.rand()).limit(target_account_count).with_for_update()))
+    if len(accounts) < target_account_count:
+        raise HTTPException(409, f"可用抖音账号不足，需要 {target_account_count} 个，当前只有 {len(accounts)} 个")
+    task = Task(customer_id=user.id, room_id=payload.room_id, target_account_count=target_account_count,
                 min_interval_seconds=payload.min_interval_seconds, max_interval_seconds=payload.max_interval_seconds)
     db.add(task)
     await db.flush()
     db.add_all([TaskScript(task_id=task.id, script_id=script.id) for script in scripts])
+    for account in accounts:
+        account.current_task_id = task.id
+        account.status = "busy"
+        db.add(TaskAccount(task_id=task.id, account_id=account.id, status="assigned", assigned_by=user.id))
     await db.commit()
     await db.refresh(task)
+    await redis_client.rpush("douyin:tasks", str(task.id))
     return task
 
 
@@ -68,23 +127,97 @@ async def list_tasks(user: Annotated[User, Depends(customer_user)], db: Annotate
     return list(result)
 
 
+@router.get("/tasks/{task_id}", response_model=TaskResponse)
+async def get_task(task_id: int, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    task = await db.scalar(select(Task).where(
+        Task.id == task_id, Task.customer_id == user.id, Task.deleted_at.is_(None)
+    ))
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    return task
+
+
+@router.get("/tasks/{task_id}/comment-logs", response_model=list[CommentLogResponse])
+async def task_comment_logs(task_id: int, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    task = await db.scalar(select(Task).where(
+        Task.id == task_id, Task.customer_id == user.id, Task.deleted_at.is_(None)
+    ))
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    result = await db.scalars(select(CommentLog).where(
+        CommentLog.task_id == task_id, CommentLog.deleted_at.is_(None)
+    ).order_by(CommentLog.id.desc()).limit(200))
+    return list(result)
+
+
+@router.get("/tasks/{task_id}/accounts", response_model=list[TaskAccountResponse])
+async def task_accounts(task_id: int, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    task = await db.scalar(select(Task).where(
+        Task.id == task_id, Task.customer_id == user.id, Task.deleted_at.is_(None)
+    ))
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    result = await db.scalars(select(TaskAccount).where(
+        TaskAccount.task_id == task_id, TaskAccount.deleted_at.is_(None)
+    ).order_by(TaskAccount.id))
+    return list(result)
+
+
 async def _change_task_status(task_id: int, status: str, user: User, db: AsyncSession):
     task = await db.scalar(select(Task).where(Task.id == task_id, Task.customer_id == user.id, Task.deleted_at.is_(None)))
     if not task:
         raise HTTPException(404, "任务不存在")
+    if status == "paused" and task.status not in {"pending", "running"}:
+        raise HTTPException(409, "当前任务状态不能暂停")
+    if status == "stopped" and task.status in {"stopped", "failed", "completed"}:
+        raise HTTPException(409, "当前任务已经结束")
     task.status = status
     if status == "paused":
         task.paused_at = datetime.now()
+    stopped_assignment_ids: list[int] = []
     if status == "stopped":
         task.stopped_at = datetime.now()
+        assigned = list(await db.scalars(select(TaskAccount).where(
+            TaskAccount.task_id == task.id, TaskAccount.status.not_in(("removed", "completed")),
+            TaskAccount.deleted_at.is_(None),
+        ).with_for_update()))
+        account_ids = [item.account_id for item in assigned]
+        if account_ids:
+            accounts = await db.scalars(select(DouyinAccount).where(DouyinAccount.id.in_(account_ids)).with_for_update())
+            for account in accounts:
+                if account.current_task_id == task.id:
+                    account.current_task_id = None
+                    account.status = "available" if account.enabled else "disabled"
+        for item in assigned:
+            stopped_assignment_ids.append(item.id)
+            item.status = "removed"
+            item.removed_at = datetime.now()
     await db.commit()
     await db.refresh(task)
+    for assignment_id in stopped_assignment_ids:
+        await redis_client.rpush(f"douyin:task-account:stop:{assignment_id}", "stop")
     return task
 
 
 @router.post("/tasks/{task_id}/pause", response_model=TaskResponse)
 async def pause_task(task_id: int, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
     return await _change_task_status(task_id, "paused", user, db)
+
+
+@router.post("/tasks/{task_id}/resume", response_model=TaskResponse)
+async def resume_task(task_id: int, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    task = await db.scalar(select(Task).where(Task.id == task_id, Task.customer_id == user.id, Task.deleted_at.is_(None)))
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    if task.status != "paused":
+        raise HTTPException(409, "只有已暂停任务可以继续")
+    task.status = "running" if task.started_at else "pending"
+    task.paused_at = None
+    await db.commit()
+    await db.refresh(task)
+    if task.status == "pending":
+        await redis_client.rpush("douyin:tasks", str(task.id))
+    return task
 
 
 @router.post("/tasks/{task_id}/stop", response_model=TaskResponse)

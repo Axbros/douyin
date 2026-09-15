@@ -11,5 +11,6 @@ passlib[argon2]>=1.7
 cryptography>=43.0
 python-multipart>=0.0.9
 playwright>=1.40
+psutil>=6.0
 protobuf>=4.24
 pyyaml>=6.0

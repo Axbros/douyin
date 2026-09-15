@@ -23,6 +23,8 @@ class User(TimestampMixin, Base):
     password_hash: Mapped[str] = mapped_column(String(255))
     display_name: Mapped[str] = mapped_column(String(100))
     status: Mapped[str] = mapped_column(String(20), default="active")
+    last_login_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=3), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=3), nullable=True)
 
 
 class Script(TimestampMixin, Base):
@@ -109,6 +111,17 @@ class TaskScript(TimestampMixin, Base):
     __table_args__ = (UniqueConstraint("task_id", "script_id", name="uk_task_scripts_pair"),)
 
 
+class TaskAccount(TimestampMixin, Base):
+    __tablename__ = "task_accounts"
+    task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"))
+    account_id: Mapped[int] = mapped_column(ForeignKey("douyin_accounts.id"))
+    status: Mapped[str] = mapped_column(String(20), default="assigned")
+    assigned_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    assigned_at: Mapped[datetime] = mapped_column(DATETIME(fsp=3), server_default="CURRENT_TIMESTAMP(3)")
+    removed_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=3), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
+
 class CommentLog(TimestampMixin, Base):
     __tablename__ = "comment_logs"
     task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id"))
@@ -119,3 +132,18 @@ class CommentLog(TimestampMixin, Base):
     failure_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
     sensitive_word: Mapped[str | None] = mapped_column(String(255), nullable=True)
     sent_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=3), nullable=True)
+
+
+class SensitiveWord(TimestampMixin, Base):
+    __tablename__ = "sensitive_words"
+    word: Mapped[str] = mapped_column(String(255), unique=True)
+    match_type: Mapped[str] = mapped_column(String(20), default="contains")
+    enabled: Mapped[bool] = mapped_column(default=True)
+    created_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
+
+
+class SystemSetting(TimestampMixin, Base):
+    __tablename__ = "system_settings"
+    setting_key: Mapped[str] = mapped_column(String(100), unique=True)
+    setting_value: Mapped[dict] = mapped_column(JSON)
+    updated_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)

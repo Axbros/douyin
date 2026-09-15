@@ -8,6 +8,7 @@ app.log
 .workbuddy/
 .trae/
 *.log
+.runtime/
 
 # ===== Python =====
 __pycache__/
@@ -46,9 +47,6 @@ models/
 *.lnk
 src/*.svg
 
-# ===== 开发调试脚本（仅本地使用，不推送）=====
-scripts/
-
 # Backend secrets and local environment
 backend/.env
 backend/.env.*
@@ -66,6 +64,15 @@ backend/browser-data/
 *.sqlite3
 *.db
 *.pem
+
+# Frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+*.tsbuildinfo
 
 # ===== 抓包报告（含敏感请求信息）=====
 douyin_capture_report.txt

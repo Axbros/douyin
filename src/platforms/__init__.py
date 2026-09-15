@@ -8,8 +8,17 @@
 
 from src.platforms.base import Platform
 from src.platforms.registry import create_platform, list_platforms
-from src.platforms.kuaishou import KuaishouPlatform
-from src.platforms.douyin import DouyinPlatform
+
+
+def __getattr__(name: str):
+    """兼容原有公开类，同时避免启动抖音 Worker 时加载快手 protobuf。"""
+    if name == "KuaishouPlatform":
+        from src.platforms.kuaishou import KuaishouPlatform
+        return KuaishouPlatform
+    if name == "DouyinPlatform":
+        from src.platforms.douyin import DouyinPlatform
+        return DouyinPlatform
+    raise AttributeError(name)
 
 __all__ = [
     "Platform",
