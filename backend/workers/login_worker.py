@@ -127,6 +127,27 @@ async def second_verification_container(page, context=None):
     for browser_page in pages:
         for frame in browser_page.frames:
             try:
+                # 新版弹窗通过 portal 直接挂到 body，未必位于 #uc-second-verify 下。
+                # 优先选择可见的“身份验证” article，避免命中仍留在 DOM 中的旧/隐藏根节点。
+                semantic_panels = frame.locator(
+                    'article[class*="verification_component_layout-"]'
+                )
+                for index in range(await semantic_panels.count()):
+                    panel = semantic_panels.nth(index)
+                    if not await panel.is_visible():
+                        continue
+                    panel_text = " ".join((await panel.inner_text()).split())
+                    has_identity_title = "身份验证" in panel_text
+                    has_verification_content = any(marker in panel_text for marker in (
+                        "手机刷脸验证",
+                        "验证登录密码",
+                        "接收短信验证码",
+                        "发送短信验证",
+                        "请输入验证码",
+                        "请输入登录密码",
+                    ))
+                    if has_identity_title and has_verification_content:
+                        return panel
                 containers = frame.locator("#uc-second-verify")
                 for index in range(await containers.count()):
                     container = containers.nth(index)
@@ -786,7 +807,7 @@ async def run_session(session_id: int):
                         login_candidate_at = None
                         if not verification_detected:
                             verification_detected = True
-                            print(f"[LoginWorker] 检测到二次认证区域 #uc-second-verify，会话 {session_id}", flush=True)
+                            print(f"[LoginWorker] 检测到可见二次认证面板，会话 {session_id}", flush=True)
                         input_box = await verification_input(second_verify)
                         second_verify_password_box = await login_password_input(second_verify)
                         if second_verify_password_box is not None:
