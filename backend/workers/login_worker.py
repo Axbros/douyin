@@ -127,8 +127,8 @@ async def second_verification_container(page, context=None):
     for browser_page in pages:
         for frame in browser_page.frames:
             try:
-                # 新版弹窗通过 portal 直接挂到 body，未必位于 #uc-second-verify 下。
-                # 优先选择可见的“身份验证” article，避免命中仍留在 DOM 中的旧/隐藏根节点。
+                # #uc-second-verify 外层自身可能没有可见尺寸，但内部 article 已经显示。
+                # 优先返回实际可见的“身份验证”面板，避免被外层尺寸判断漏掉。
                 semantic_panels = frame.locator(
                     'article[class*="verification_component_layout-"]'
                 )
@@ -153,12 +153,16 @@ async def second_verification_container(page, context=None):
                     container = containers.nth(index)
                     # 有些弹层根 div 自身没有尺寸，但内部文字或输入框可见。
                     sms_items = container.locator("div").filter(has_text=re.compile(r"接收\s*短信\s*验证码"))
+                    method_items = container.locator(
+                        '[class*="verification_component_list_item-"]'
+                    )
                     inputs = container.locator(
                         '#button-input, input[placeholder="请输入验证码"], '
                         'input[placeholder*="登录密码"], input[type="password"]'
                     )
                     child_visible = any([
                         *[await sms_items.nth(i).is_visible() for i in range(await sms_items.count())],
+                        *[await method_items.nth(i).is_visible() for i in range(await method_items.count())],
                         *[await inputs.nth(i).is_visible() for i in range(await inputs.count())],
                     ])
                     if child_visible or await container.is_visible():
