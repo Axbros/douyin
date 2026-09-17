@@ -191,7 +191,7 @@ async def click_sms_verification(container) -> bool:
 
 
 async def verification_methods(container) -> list[dict[str, str | None]]:
-    """读取认证方式列表；只使用 class 的语义前缀，不使用动态后缀。"""
+    """读取认证方式列表，兼容抖音新旧版动态 class。"""
     candidates = container.locator('[class*="verification_component_list_item-"]')
     if not await candidates.count():
         # 页面去掉语义 class 时，按“直属 SVG 图标 + 直属文本内容”的列表项结构兜底。
@@ -227,6 +227,39 @@ async def verification_methods(container) -> list[dict[str, str | None]]:
                 "label": lines[0],
                 "description": " ".join(lines[1:]) or None,
             })
+        except Exception:
+            continue
+
+    # 新版身份验证弹窗不再保留 verification_component_list_item 语义 class。
+    # 这些文案是用户可见的产品文字，比每次发布都会变化的 class 稳定。
+    known_labels = (
+        "手机刷脸验证",
+        "验证登录密码",
+        "接收短信验证码",
+        "发送短信验证",
+        "手机验证码验证",
+        "短信验证码验证",
+    )
+    for label in known_labels:
+        if label in seen_labels:
+            continue
+        try:
+            labels = container.get_by_text(label, exact=True)
+            visible_label = None
+            for index in range(await labels.count()):
+                item = labels.nth(index)
+                if await item.is_visible():
+                    visible_label = item
+                    break
+            if visible_label is None:
+                continue
+            method_id = f"method-{len(options)}"
+            await visible_label.evaluate(
+                "(element, value) => element.setAttribute('data-login-method-id', value)",
+                method_id,
+            )
+            seen_labels.add(label)
+            options.append({"id": method_id, "label": label, "description": None})
         except Exception:
             continue
     return options
@@ -499,7 +532,7 @@ async def fill_and_submit_verification(container, code: str) -> bool:
     return False
 
 
-async def fill_and_submit_password(container, password: str, input_box=None) -> bool:
+async def fill_login_password(container, password: str, input_box=None) -> bool:
     try:
         if input_box is None:
             input_box = await login_password_input(container)
@@ -560,19 +593,19 @@ async def fill_and_submit_password(container, password: str, input_box=None) -> 
         )
         await asyncio.sleep(0.5)
         if await input_box.input_value() != password:
-            print("[LoginWorker] 登录密码写入后被页面清空，停止点击验证", flush=True)
+            print("[LoginWorker] 登录密码写入后被页面清空", flush=True)
             return False
-        print("[LoginWorker] 已确认登录密码写入二次认证输入框，等待 1 秒后点击验证", flush=True)
+        print("[LoginWorker] 已确认登录密码写入二次认证输入框", flush=True)
         await input_box.press("Tab")
-        # 密码写入并失焦后固定等待 1 秒，让抖音完成表单状态和按钮状态更新。
-        await asyncio.sleep(1)
+        # 失焦后让抖音完成表单状态更新；点击由后台的“验证密码”按钮单独触发。
+        await asyncio.sleep(0.3)
         if await input_box.input_value() != password:
-            print("[LoginWorker] 登录密码输入框失焦后被页面清空，停止点击验证", flush=True)
+            print("[LoginWorker] 登录密码输入框失焦后被页面清空", flush=True)
             return False
-        return await click_verification_button(container, input_box)
+        return True
     except Exception as exc:
         print(
-            f"[LoginWorker] 填写登录密码或提交验证异常: {type(exc).__name__}: {exc}",
+            f"[LoginWorker] 填写登录密码异常: {type(exc).__name__}: {exc}",
             flush=True,
         )
         return False
@@ -872,27 +905,53 @@ async def run_session(session_id: int):
                                         f"[LoginWorker] 登录密码验证超时，等待重新提交，会话 {session_id}",
                                         flush=True,
                                     )
-                            if session.status == "password_required":
+                            if session.status in ("password_required", "password_ready"):
                                 encrypted_password = await redis_client.lpop(f"douyin:login:password:{session_id}")
                                 if encrypted_password:
                                     password = decrypt_transient_secret(encrypted_password)
-                                    submitted = await fill_and_submit_password(
+                                    filled = await fill_login_password(
                                         password_action_scope,
                                         password,
                                         password_box,
                                     )
                                     password = ""
-                                    if submitted:
+                                    if filled:
+                                        session.status = "password_ready"
+                                        session.failure_reason = None
+                                        await db.commit()
+                                        await publish(session.id, "password_ready")
+                                        print(
+                                            f"[LoginWorker] 登录密码已填入浏览器，等待后台点击验证密码，会话 {session_id}",
+                                            flush=True,
+                                        )
+                                    else:
+                                        session.status = "password_required"
+                                        session.failure_reason = "未能填写登录密码，请查看浏览器画面后重试"
+                                        await db.commit()
+                            if session.status == "password_ready":
+                                verify_requested = await redis_client.lpop(
+                                    f"douyin:login:password-verify:{session_id}"
+                                )
+                                if verify_requested:
+                                    clicked = await click_verification_button(
+                                        password_action_scope,
+                                        password_box,
+                                    )
+                                    if clicked:
                                         session.status = "password_verifying"
                                         session.failure_reason = None
                                         await db.commit()
                                         await publish(session.id, "password_verifying")
                                         password_submitted_at = asyncio.get_running_loop().time()
-                                        print(f"[LoginWorker] 已填写登录密码并点击验证，会话 {session_id}", flush=True)
+                                        print(f"[LoginWorker] 已点击登录密码验证按钮，会话 {session_id}", flush=True)
                                     else:
-                                        session.status = "password_required"
-                                        session.failure_reason = "未能填写登录密码或点击验证按钮，请查看浏览器画面后重试"
+                                        session.failure_reason = "未找到可点击的验证按钮，请查看浏览器画面后重试"
                                         await db.commit()
+                                        await publish(
+                                            session.id,
+                                            "password_ready",
+                                            reason=session.failure_reason,
+                                        )
                             await asyncio.sleep(0.5)
                             continue
                         if input_box is not None and not verification_announced:
@@ -1022,7 +1081,7 @@ async def reconcile_interrupted_sessions():
     queued_ids = {int(value) for value in queued_values}
     async with SessionLocal() as db:
         sessions = list(await db.scalars(select(AccountLoginSession).where(
-            AccountLoginSession.status.in_(("waiting", "method_required", "method_processing", "password_required", "password_verifying", "verify_required", "verifying")),
+            AccountLoginSession.status.in_(("waiting", "method_required", "method_processing", "password_required", "password_filling", "password_ready", "password_clicking", "password_verifying", "verify_required", "verifying")),
             AccountLoginSession.deleted_at.is_(None),
         )))
         changed = 0

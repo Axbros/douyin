@@ -209,6 +209,13 @@ async def owned_login_password(session_id: int, payload: LoginPasswordRequest, u
     return await submit_login_password(session_id, payload, user, db)
 
 
+@router.post("/douyin-login-sessions/{session_id}/verify-login-password", status_code=202)
+async def owned_verify_login_password(session_id: int, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    await _get_owned_session(session_id, user, db)
+    from app.api.admin import verify_login_password
+    return await verify_login_password(session_id, user, db)
+
+
 @router.post("/douyin-login-sessions/{session_id}/close", response_model=LoginSessionResponse)
 async def close_owned_login_session(session_id: int, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
     await _get_owned_session(session_id, user, db)

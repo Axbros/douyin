@@ -694,7 +694,7 @@ async def create_login_session(account_id: int, user: Annotated[User, Depends(ad
         raise HTTPException(409, "账号正在执行任务，不能重新扫码登录")
     active_session = await db.scalar(select(AccountLoginSession.id).where(
         AccountLoginSession.account_id == account.id,
-        AccountLoginSession.status.in_(("waiting", "method_required", "method_processing", "password_required", "password_verifying", "verify_required", "verifying")),
+        AccountLoginSession.status.in_(("waiting", "method_required", "method_processing", "password_required", "password_filling", "password_ready", "password_clicking", "password_verifying", "verify_required", "verifying")),
         AccountLoginSession.expires_at > datetime.now(),
         AccountLoginSession.deleted_at.is_(None),
     ).limit(1))
@@ -885,7 +885,7 @@ async def submit_login_password(
     ))
     if not session:
         raise HTTPException(404, "登录会话不存在")
-    if session.status != "password_required":
+    if session.status not in ("password_required", "password_ready"):
         selected_raw = await redis_client.get(f"douyin:login:selected-verification:{session.id}")
         try:
             selected = json.loads(selected_raw) if selected_raw else None
@@ -907,7 +907,7 @@ async def submit_login_password(
         pipe.rpush(queue_key, encrypt_transient_secret(payload.password))
         pipe.expire(queue_key, 120)
         await pipe.execute()
-    session.status = "password_verifying"
+    session.status = "password_filling"
     session.failure_reason = None
     db.add(AccountLog(
         account_id=session.account_id,
@@ -915,7 +915,40 @@ async def submit_login_password(
         detail={"session_id": session.id, "admin_id": user.id},
     ))
     await db.commit()
-    return {"message": "登录密码已提交到登录浏览器"}
+    return {"message": "登录密码已提交到登录浏览器，填写完成后请点击验证密码"}
+
+
+@router.post("/douyin-login-sessions/{session_id}/verify-login-password", status_code=202)
+async def verify_login_password(
+    session_id: int,
+    user: Annotated[User, Depends(admin_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    session = await db.scalar(select(AccountLoginSession).where(
+        AccountLoginSession.id == session_id,
+        AccountLoginSession.deleted_at.is_(None),
+    ))
+    if not session:
+        raise HTTPException(404, "登录会话不存在")
+    if session.status != "password_ready":
+        raise HTTPException(409, "登录密码尚未填写到浏览器，请先提交密码")
+    if session.expires_at <= datetime.now():
+        raise HTTPException(409, "登录会话已过期")
+    queue_key = f"douyin:login:password-verify:{session.id}"
+    async with redis_client.pipeline(transaction=True) as pipe:
+        pipe.delete(queue_key)
+        pipe.rpush(queue_key, "verify")
+        pipe.expire(queue_key, 120)
+        await pipe.execute()
+    session.status = "password_clicking"
+    session.failure_reason = None
+    db.add(AccountLog(
+        account_id=session.account_id,
+        event_type="login_password_verify_requested",
+        detail={"session_id": session.id, "admin_id": user.id},
+    ))
+    await db.commit()
+    return {"message": "验证密码指令已发送到登录浏览器"}
 
 
 @router.post("/douyin-login-sessions/{session_id}/close", response_model=LoginSessionResponse)
@@ -928,6 +961,7 @@ async def close_login_session(session_id: int, user: Annotated[User, Depends(adm
     await redis_client.delete(
         f"douyin:login:verification:{session.id}",
         f"douyin:login:password:{session.id}",
+        f"douyin:login:password-verify:{session.id}",
         f"douyin:login:verification-method:{session.id}",
         f"douyin:login:verification-options:{session.id}",
         f"douyin:login:selected-verification:{session.id}",
