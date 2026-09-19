@@ -28,6 +28,7 @@ class LoginBrowserPool:
         self.desired_size = size
         self.target_proxy_config: dict | None = None
         self.ready: deque[PreparedBrowser] = deque()
+        self.claimed: dict[str, PreparedBrowser] = {}
         self.pending: dict[asyncio.Task, dict | None] = {}
         self.disposing: set[asyncio.Task] = set()
         self.lock = asyncio.Lock()
@@ -61,6 +62,7 @@ class LoginBrowserPool:
                 if item.proxy_config == proxy_config:
                     self.ready.remove(item)
                     if item.browser.is_connected() and not item.page.is_closed():
+                        self.claimed[item.resource_id] = item
                         print(f"[LoginWorker] 领取预热浏览器，剩余 {len(self.ready)} 个", flush=True)
                         return item
                     await self.dispose(item)
@@ -99,7 +101,9 @@ class LoginBrowserPool:
 
     async def replenish(self, proxy_config: dict | None) -> None:
         async with self.lock:
-            existing = [item.proxy_config for item in self.ready] + list(self.pending.values())
+            existing = ([item.proxy_config for item in self.ready]
+                        + [item.proxy_config for item in self.claimed.values()]
+                        + list(self.pending.values()))
             for config in self._desired_configs():
                 if config in existing:
                     existing.remove(config)
@@ -115,6 +119,9 @@ class LoginBrowserPool:
         async with self.lock:
             self.target_proxy_config = proxy_config
             desired = self._desired_configs()
+            for item in self.claimed.values():
+                if item.proxy_config in desired:
+                    desired.remove(item.proxy_config)
             stale = []
             kept = deque()
             for item in self.ready:
@@ -136,6 +143,29 @@ class LoginBrowserPool:
         await asyncio.gather(*(self.dispose(item) for item in stale))
         await self.replenish(proxy_config)
 
+    async def return_claimed(self, item: PreparedBrowser) -> bool:
+        async with self.lock:
+            if self.claimed.pop(item.resource_id, None) is None:
+                return False
+            if self.closed or not item.browser.is_connected() or item.page.is_closed():
+                return False
+            remaining = self._desired_configs()
+            for other in [*self.ready, *self.claimed.values()]:
+                if other.proxy_config in remaining:
+                    remaining.remove(other.proxy_config)
+            for config in self.pending.values():
+                if config in remaining:
+                    remaining.remove(config)
+            if item.proxy_config not in remaining:
+                return False
+            self.ready.append(item)
+            print(f"[LoginWorker] 登录浏览器已返回备用池，现有 {len(self.ready)} 个", flush=True)
+            return True
+
+    async def release_claimed(self, resource_id: str) -> None:
+        async with self.lock:
+            self.claimed.pop(resource_id, None)
+
     async def navigate_slot(self, resource_id: str, url: str) -> str:
         async with self.lock:
             item = next((entry for entry in self.ready if entry.resource_id == resource_id), None)
@@ -154,7 +184,7 @@ class LoginBrowserPool:
             print(f"[LoginWorker] 补充预热浏览器失败: {type(exc).__name__}: {exc}", flush=True)
             return
         remaining = self._desired_configs()
-        for ready_item in self.ready:
+        for ready_item in [*self.ready, *self.claimed.values()]:
             if ready_item.proxy_config in remaining:
                 remaining.remove(ready_item.proxy_config)
         if self.closed or item.proxy_config not in remaining:

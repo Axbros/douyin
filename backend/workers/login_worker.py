@@ -94,6 +94,23 @@ async def prepare_login_browser(proxy_config: dict | None) -> PreparedBrowser:
         raise
 
 
+async def recycle_claimed_browser(item: PreparedBrowser, browser_pool: LoginBrowserPool) -> bool:
+    """Keep the Chromium process, but discard all cookies and page storage from the login attempt."""
+    await item.context.close()
+    fresh_context = await item.browser.new_context()
+    try:
+        fresh_page = await fresh_context.new_page()
+        await fresh_page.goto(LOGIN_FALLBACK_URL, wait_until="domcontentloaded", timeout=20000)
+        item.context = fresh_context
+        item.page = fresh_page
+        if item.proxy_config is not None and browser_pool.target_proxy_config != item.proxy_config:
+            await browser_pool.retarget(item.proxy_config)
+        return await browser_pool.return_claimed(item)
+    except BaseException:
+        await fresh_context.close()
+        raise
+
+
 async def initial_warm_proxy_config() -> dict | None:
     """Prefer a pending account's proxy, then the proxy used by the next new account."""
     async with SessionLocal() as db:
@@ -166,7 +183,7 @@ async def stop_closed_browser(session_id: int, browser, context, playwright):
         pass
 
 
-async def wait_for_manual_close(session_id: int, browser, context, playwright, page=None):
+async def wait_for_manual_close(session_id: int, browser, context, playwright, page=None, on_close=None):
     """浏览器保持打开，直到管理员调用接口或直接关闭窗口。"""
     print(f"[LoginWorker] 浏览器保持打开，等待手动关闭，会话 {session_id}", flush=True)
     while True:
@@ -176,11 +193,14 @@ async def wait_for_manual_close(session_id: int, browser, context, playwright, p
         if page is not None:
             await answer_screenshot_requests("login", session_id, page)
         if await redis_client.blpop(f"douyin:login:close:{session_id}", timeout=1):
-            await close_browser(session_id, browser, context, playwright)
+            if on_close:
+                await on_close()
+            else:
+                await close_browser(session_id, browser, context, playwright)
             return
 
 
-async def navigate_or_close(page, url: str, session_id: int, browser, context, playwright, timeout: int = 60000) -> bool:
+async def navigate_or_close(page, url: str, session_id: int, browser, context, playwright, timeout: int = 60000, on_close=None) -> bool:
     """导航期间同时监听关闭指令；返回 True 表示浏览器已被关闭。"""
     # 完整 load 可能被第三方资源拖住；DOM、登录入口就绪后可继续。
     async def load_login_page():
@@ -194,7 +214,10 @@ async def navigate_or_close(page, url: str, session_id: int, browser, context, p
         navigation.cancel()
         await asyncio.gather(navigation, return_exceptions=True)
         try:
-            await close_browser(session_id, browser, context, playwright)
+            if on_close:
+                await on_close()
+            else:
+                await close_browser(session_id, browser, context, playwright)
         except Exception:
             pass
         return True
@@ -886,6 +909,24 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
         resource_task = None
         proxy_config = None
         browser_claimed = False
+        prepared = None
+
+        async def close_or_recycle_browser() -> None:
+            nonlocal proxy_bridge, resource_task
+            if browser_claimed and prepared is not None and session.status != "success":
+                if resource_task:
+                    resource_task.cancel()
+                    await asyncio.gather(resource_task, return_exceptions=True)
+                    resource_task = None
+                try:
+                    if await recycle_claimed_browser(prepared, browser_pool):
+                        # The pool now owns the browser and its authenticated SOCKS5 bridge.
+                        proxy_bridge = None
+                        print(f"[LoginWorker] 关闭扫码弹窗后已复用 Chromium，会话 {session_id}，页面 {LOGIN_FALLBACK_URL}", flush=True)
+                        return
+                except Exception as exc:
+                    print(f"[LoginWorker] 恢复备用浏览器失败，会话 {session_id}: {type(exc).__name__}: {exc}", flush=True)
+            await close_browser(session_id, browser, context, p)
         try:
             try:
                 proxy_config = await browser_proxy_for_account(db, account)
@@ -930,23 +971,23 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
             try:
                 if not browser_claimed:
                     try:
-                        if await navigate_or_close(page, LOGIN_HOME_URL, session_id, browser, context, p, timeout=20000):
+                        if await navigate_or_close(page, LOGIN_HOME_URL, session_id, browser, context, p, timeout=20000, on_close=close_or_recycle_browser):
                             return
                     except PlaywrightError as exc:
                         print(f"[LoginWorker] 抖音首页导航失败，尝试直播首页，会话 {session_id}: {type(exc).__name__}", flush=True)
                     if not await login_home_usable(page):
                         print(f"[LoginWorker] 抖音首页没有可用登录入口，改用直播首页，会话 {session_id}", flush=True)
-                        if await navigate_or_close(page, LOGIN_FALLBACK_URL, session_id, browser, context, p):
+                        if await navigate_or_close(page, LOGIN_FALLBACK_URL, session_id, browser, context, p, on_close=close_or_recycle_browser):
                             return
                 elif not await login_home_usable(page):
                     print(f"[LoginWorker] 备用浏览器页面没有登录入口，尝试直播首页，会话 {session_id}", flush=True)
-                    if await navigate_or_close(page, LOGIN_FALLBACK_URL, session_id, browser, context, p):
+                    if await navigate_or_close(page, LOGIN_FALLBACK_URL, session_id, browser, context, p, on_close=close_or_recycle_browser):
                         return
                 print(f"[LoginWorker] 抖音页面加载完毕，会话 {session_id}，开始查找登录按钮", flush=True)
                 clicked = False
                 for _ in range(60):
                     if await redis_client.lpop(f"douyin:login:close:{session_id}"):
-                        await close_browser(session_id, browser, context, p)
+                        await close_or_recycle_browser()
                         return
                     if await answer_login_click_requests(session_id, page, platform):
                         clicked = True
@@ -962,7 +1003,7 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
                 for qr_attempt in range(1, 11):
                     await answer_screenshot_requests("login", session_id, page)
                     if await redis_client.lpop(f"douyin:login:close:{session_id}"):
-                        await close_browser(session_id, browser, context, p)
+                        await close_or_recycle_browser()
                         return
                     await answer_login_click_requests(session_id, page, platform)
                     if await answer_login_qr_requests(session_id, page, session, db):
@@ -982,7 +1023,7 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
                             timeout=3,
                         )
                         if close_requested:
-                            await close_browser(session_id, browser, context, p)
+                            await close_or_recycle_browser()
                             return
                         clicked_again = await platform.click_login_button(
                             page,
@@ -999,7 +1040,7 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
                     while datetime.now() < session.expires_at:
                         await answer_screenshot_requests("login", session_id, page)
                         if await redis_client.lpop(f"douyin:login:close:{session_id}"):
-                            await close_browser(session_id, browser, context, p)
+                            await close_or_recycle_browser()
                             return
                         if await browser_window_closed(browser, context):
                             session.status = "cancelled"
@@ -1028,7 +1069,7 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
                     await db.commit()
                     await publish(session.id, "expired")
                     print(f"[LoginWorker] 登录会话已过期，会话 {session_id}", flush=True)
-                    await wait_for_manual_close(session_id, browser, context, p, page)
+                    await wait_for_manual_close(session_id, browser, context, p, page, on_close=close_or_recycle_browser)
                     return
                 print(f"[LoginWorker] 已启动二次认证定时检测，会话 {session_id}，间隔 0.5 秒", flush=True)
                 deadline = session.expires_at.timestamp()
@@ -1055,7 +1096,7 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
                     # 扫码等待期间也要响应后台关闭弹窗的操作。
                     close_requested = await redis_client.lpop(f"douyin:login:close:{session_id}")
                     if close_requested:
-                        await close_browser(session_id, browser, context, p)
+                        await close_or_recycle_browser()
                         return
                     if await browser_window_closed(browser, context):
                         session.status = "cancelled"
@@ -1332,9 +1373,11 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
                         await db.commit()
                         await publish(session.id, "success", account_id=account.id)
                         print(f"[LoginWorker] 扫码登录成功，会话 {session_id}", flush=True)
-                        # Login window stays open for manual inspection; replenish the idle pool now.
+                        # 登录成功的浏览器属于该账号，不再占用备用池名额。
+                        if browser_claimed and prepared is not None:
+                            await browser_pool.release_claimed(prepared.resource_id)
                         await browser_pool.retarget(proxy_config)
-                        await wait_for_manual_close(session_id, browser, context, p, page)
+                        await wait_for_manual_close(session_id, browser, context, p, page, on_close=close_or_recycle_browser)
                         account.status = "available" if account.enabled else "disabled"
                         await db.commit()
                         print(f"[LoginWorker] 登录浏览器已关闭，账号 {account.id} 可以分配任务", flush=True)
@@ -1348,7 +1391,7 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
                 await db.commit()
                 await publish(session.id, "expired")
                 print(f"[LoginWorker] 登录会话已过期，会话 {session_id}", flush=True)
-                await wait_for_manual_close(session_id, browser, context, p, page)
+                await wait_for_manual_close(session_id, browser, context, p, page, on_close=close_or_recycle_browser)
             except Exception as exc:
                 session.status = "failed"
                 session.failure_reason = f"{type(exc).__name__}: {exc}"[:500]
@@ -1357,7 +1400,7 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
                 await db.commit()
                 await publish(session.id, "failed", reason=session.failure_reason)
                 print(f"[LoginWorker] 登录会话失败，会话 {session_id}: {session.failure_reason}", flush=True)
-                await wait_for_manual_close(session_id, browser, context, p, page)
+                await wait_for_manual_close(session_id, browser, context, p, page, on_close=close_or_recycle_browser)
         except asyncio.CancelledError:
             await dispose_prepared_browser(PreparedBrowser(p, browser, context, page, proxy_config, proxy_bridge))
             proxy_bridge = None
@@ -1366,7 +1409,7 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
             if browser:
                 print(f"[LoginWorker] Worker 内部异常，会话 {session_id}，浏览器仍保持打开", flush=True)
                 # 发生未预期异常时也保留浏览器，便于管理员检查页面并手动结束会话。
-                await wait_for_manual_close(session_id, browser, context, p, page)
+                await wait_for_manual_close(session_id, browser, context, p, page, on_close=close_or_recycle_browser)
             else:
                 # Chromium 尚未启动时没有可保留的浏览器，释放 Playwright 驱动。
                 if p:
@@ -1389,7 +1432,8 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
             if proxy_bridge:
                 await proxy_bridge.close()
             if browser_claimed:
-                # Cancelled and failed logins also consume the prepared browser.
+                if prepared is not None:
+                    await browser_pool.release_claimed(prepared.resource_id)
                 await browser_pool.replenish(proxy_config)
 
 

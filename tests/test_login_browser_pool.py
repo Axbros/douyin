@@ -2,6 +2,7 @@ import asyncio
 import unittest
 
 from backend.app.core.login_browser_pool import LoginBrowserPool, PreparedBrowser
+from backend.workers.login_worker import LOGIN_FALLBACK_URL, recycle_claimed_browser
 
 
 class FakeBrowser:
@@ -20,6 +21,46 @@ class FakePage:
 
 
 class LoginBrowserPoolTest(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_login_returns_same_chromium_with_clean_context(self):
+        prepared = []
+
+        class Context:
+            def __init__(self):
+                self.closed = False
+
+            async def close(self):
+                self.closed = True
+
+            async def new_page(self):
+                return FakePage()
+
+        class Browser(FakeBrowser):
+            async def new_context(self):
+                return Context()
+
+        async def prepare(config):
+            item = PreparedBrowser(None, Browser(), Context(), FakePage(), config)
+            prepared.append(item)
+            return item
+
+        async def dispose(item):
+            pass
+
+        pool = LoginBrowserPool(prepare, dispose)
+        await pool.initialize(None)
+        claimed = await pool.claim(None)
+        old_context = claimed.context
+        await pool.replenish(None)
+        self.assertEqual(len(prepared), 2, "领取期间不应再启动一个替代 Chromium")
+        self.assertTrue(await recycle_claimed_browser(claimed, pool))
+        self.assertTrue(old_context.closed)
+        self.assertIsNot(claimed.context, old_context)
+        self.assertEqual(claimed.page.url, LOGIN_FALLBACK_URL)
+        self.assertEqual(len(pool.ready), 2)
+        self.assertEqual((await pool.claim(None)).resource_id, prepared[1].resource_id)
+        self.assertEqual((await pool.claim(None)).resource_id, claimed.resource_id)
+        await pool.close()
+
     async def test_failed_initial_preheat_can_be_retried(self):
         attempts = 0
 

@@ -698,7 +698,7 @@ async function closeQr(done?: () => void) {
   stopQrTimer(); qrLoading.value = false; qrRefreshing.value = false; clickingLogin.value = false; previousQrPayload.value = ''; detectingLoginQr.value = false; qr.value = ''; verificationCode.value = ''; verificationHint.value = ''; verificationSubmitting.value = false; verificationOptions.value = []; verificationMethodId.value = ''; selectedVerificationMethod.value = null; verificationMethodSubmitting.value = false; loginPassword.value = ''; loginPasswordSubmitting.value = false; loginPasswordVerifySubmitting.value = false; loginSessionId.value = null
   if (id) {
     const response = await fetch(`/api/${loginApiScope.value}/douyin-login-sessions/${id}/close`, { method: 'POST', headers: authHeaders() })
-    if (response.ok) { notify('扫码窗口和浏览器已关闭', 'success'); loginApiScope.value === 'admin' ? await load() : await loadCustomer() } else notify('关闭浏览器失败', 'error')
+    if (response.ok) { notify('扫码窗口已关闭', 'success'); loginApiScope.value === 'admin' ? await load() : await loadCustomer() } else notify('关闭扫码窗口失败', 'error')
   }
   qrDialogVisible.value = false
   if (typeof done === 'function') done()
