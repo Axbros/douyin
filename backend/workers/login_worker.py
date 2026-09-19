@@ -10,7 +10,7 @@ import os
 import re
 import socket
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # 兼容仓库内较早生成的 protobuf 文件；必须在导入 src.platforms 前设置。
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
@@ -24,6 +24,7 @@ from app.core.browser_preview import answer_screenshot_requests
 from app.core.browser_resources import pool_command_key, remove_resource, resource_heartbeat, touch_resource
 from app.core.database import SessionLocal, redis_client
 from app.core.login_browser_pool import LoginBrowserPool, PreparedBrowser
+from app.core.platform_settings import get_platform_settings
 from app.core.proxy_pool import browser_proxy_for_account, choose_proxy_for_new_account
 from app.core.proxy_tunnel import Socks5Bridge
 from app.models import AccountLoginSession, AccountLog, DouyinAccount
@@ -256,6 +257,55 @@ async def answer_login_qr_requests(session_id: int, page, session, db) -> bool:
         await redis_client.rpush(response_key, json.dumps({"found": bool(result)}))
         await redis_client.expire(response_key, 30)
     return found
+
+
+async def answer_login_qr_refresh_requests(session_id: int, page, platform, session, db) -> bool:
+    """Refresh the same Chromium page and replace its QR when requested."""
+    request_key = f"douyin:login:qr-refresh-request:{session_id}"
+    processed = False
+    while request_id := await redis_client.lpop(request_key):
+        processed = True
+        request_id = request_id.decode() if isinstance(request_id, bytes) else request_id
+        response_key = f"douyin:login:qr-refresh-response:{request_id}"
+        result = {"found": False, "message": "刷新后暂未出现二维码，可稍后点击获取登录二维码"}
+        try:
+            if session.status != "waiting":
+                raise RuntimeError("登录已进入下一阶段，不能刷新二维码")
+            settings = await get_platform_settings(db)
+            previous_qr = session.qr_payload
+            session.expires_at = datetime.now() + timedelta(minutes=settings["qr_expire_minutes"])
+            session.qr_payload = None
+            session.failure_reason = None
+            await db.commit()
+            print(f"[LoginWorker] 正在刷新页面并重新点击登录，会话 {session_id}", flush=True)
+            await page.reload(wait_until="domcontentloaded", timeout=20000)
+            clicked = False
+            for _ in range(8):
+                if await platform.click_login_button(page, log_missing=False):
+                    clicked = True
+                    break
+                await asyncio.sleep(0.5)
+            if not clicked:
+                result["message"] = "刷新后未找到登录按钮，可查看浏览器画面后重试"
+            else:
+                for _ in range(6):
+                    qr = await read_login_qr(page)
+                    if qr and qr[0] != previous_qr:
+                        session.qr_payload = qr[0]
+                        await db.commit()
+                        await publish(session_id, "qr", image=qr[0], expires_at=session.expires_at.isoformat())
+                        result = {"found": True, "qr_payload": qr[0], "expires_at": session.expires_at.isoformat()}
+                        print(f"[LoginWorker] 已重新获取登录二维码，会话 {session_id}", flush=True)
+                        break
+                    await asyncio.sleep(1)
+        except Exception as exc:
+            result["message"] = f"刷新二维码失败：{type(exc).__name__}: {exc}"[:300]
+            print(f"[LoginWorker] 刷新二维码失败，会话 {session_id}: {type(exc).__name__}: {exc}", flush=True)
+        async with redis_client.pipeline(transaction=True) as pipe:
+            pipe.rpush(response_key, json.dumps(result, ensure_ascii=False))
+            pipe.expire(response_key, 30)
+            await pipe.execute()
+    return processed
 
 
 async def second_verification_container(page, context=None):
@@ -963,8 +1013,14 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
                 method_clicked_at: float | None = None
                 login_candidate_at: float | None = None
                 last_probe_at = asyncio.get_running_loop().time()
-                while datetime.now().timestamp() < deadline:
+                refresh_request_key = f"douyin:login:qr-refresh-request:{session_id}"
+                while datetime.now().timestamp() < deadline or await redis_client.llen(refresh_request_key):
                     await answer_screenshot_requests("login", session_id, page)
+                    if await answer_login_qr_refresh_requests(session_id, page, platform, session, db):
+                        deadline = session.expires_at.timestamp()
+                        login_candidate_at = None
+                        verification_detected = False
+                        continue
                     await answer_login_qr_requests(session_id, page, session, db)
                     # 扫码等待期间也要响应后台关闭弹窗的操作。
                     close_requested = await redis_client.lpop(f"douyin:login:close:{session_id}")

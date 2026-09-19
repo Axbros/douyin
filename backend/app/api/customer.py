@@ -199,6 +199,13 @@ async def detect_owned_login_qr(session_id: int, user: Annotated[User, Depends(c
     return await detect_login_qr(session_id, user, db)
 
 
+@router.post("/douyin-login-sessions/{session_id}/refresh-qr")
+async def refresh_owned_login_qr(session_id: int, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    await _get_owned_session(session_id, user, db)
+    from app.api.admin import refresh_login_qr
+    return await refresh_login_qr(session_id, user, db)
+
+
 @router.post("/douyin-login-sessions/{session_id}/verification-method", status_code=202)
 async def owned_verification_method(session_id: int, payload: LoginVerificationMethodRequest, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
     await _get_owned_session(session_id, user, db)
