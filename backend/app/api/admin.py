@@ -14,18 +14,19 @@ from datetime import datetime, timedelta
 from hashlib import sha256
 from secrets import token_urlsafe
 from fastapi import APIRouter, Depends, HTTPException, Response
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.database import redis_client
 from app.core.browser_preview import screenshot_request_key, screenshot_response_key
 from app.core.crypto import encrypt_transient_secret
+from app.core.proxy_pool import choose_proxy_for_new_account
 from app.core.platform_settings import get_platform_settings, update_platform_settings
 from app.core.security import hash_password
 from app.core.task_lifecycle import delete_stopped_task, restart_stopped_task
 from app.dependencies import admin_user
-from app.models import (AccountLoginSession, AccountLog, CommentLog, DouyinAccount, Script,
+from app.models import (AccountLoginSession, AccountLog, CommentLog, DouyinAccount, Proxy, Script,
                         SensitiveWord, SubscriptionPlan, Task, TaskAccount, User, Worker)
 from app.schemas import (
     AccountResponse,
@@ -42,6 +43,10 @@ from app.schemas import (
     LoginPasswordRequest,
     LoginVerificationCodeRequest,
     LoginVerificationMethodRequest,
+    ProxyAccountBind,
+    ProxyResponse,
+    ProxyUpdate,
+    ProxyWrite,
     PlatformSettingsResponse,
     PlatformSettingsUpdate,
     ScriptResponse, ScriptBatchReviewRequest,
@@ -556,6 +561,118 @@ async def delete_sensitive_word(word_id: int, user: Annotated[User, Depends(admi
     await db.commit()
 
 
+async def _get_proxy(proxy_id: int, db: AsyncSession) -> Proxy:
+    proxy = await db.scalar(select(Proxy).where(Proxy.id == proxy_id, Proxy.deleted_at.is_(None)))
+    if not proxy:
+        raise HTTPException(404, "代理不存在")
+    return proxy
+
+
+async def _proxy_response(proxy: Proxy, db: AsyncSession) -> dict:
+    result = ProxyResponse.model_validate(proxy).model_dump()
+    result["account_count"] = await db.scalar(select(func.count(DouyinAccount.id)).where(
+        DouyinAccount.proxy_id == proxy.id, DouyinAccount.deleted_at.is_(None)
+    )) or 0
+    return result
+
+
+async def _ensure_proxy_account_idle(account: DouyinAccount, db: AsyncSession) -> None:
+    if account.status in ("busy", "paused", "browser_open") or account.current_task_id:
+        raise HTTPException(409, "账号浏览器正在运行，请先关闭或停止任务")
+    active_login = await db.scalar(select(AccountLoginSession.id).where(
+        AccountLoginSession.account_id == account.id,
+        AccountLoginSession.status.in_(("waiting", "method_required", "method_processing", "password_required", "password_filling", "password_ready", "password_clicking", "password_verifying", "verify_required", "verifying")),
+        AccountLoginSession.expires_at > datetime.now(),
+        AccountLoginSession.deleted_at.is_(None),
+    ).limit(1))
+    if active_login:
+        raise HTTPException(409, "账号正在扫码登录，请先关闭登录会话")
+
+
+@router.get("/proxies", response_model=list[ProxyResponse])
+async def list_proxies(user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    items = list(await db.scalars(select(Proxy).where(Proxy.deleted_at.is_(None)).order_by(Proxy.id.desc())))
+    return [await _proxy_response(item, db) for item in items]
+
+
+@router.post("/proxies", response_model=ProxyResponse, status_code=201)
+async def create_proxy(payload: ProxyWrite, user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    if payload.expires_at <= datetime.now():
+        raise HTTPException(422, "代理到期时间必须晚于当前时间")
+    proxy = Proxy(domain=payload.domain.strip(), port=payload.port, username=payload.username,
+                  encrypted_password=encrypt_transient_secret(payload.password).encode(),
+                  expires_at=payload.expires_at, max_accounts=3)
+    db.add(proxy)
+    await db.commit()
+    await db.refresh(proxy)
+    return await _proxy_response(proxy, db)
+
+
+@router.patch("/proxies/{proxy_id}", response_model=ProxyResponse)
+async def update_proxy(proxy_id: int, payload: ProxyUpdate, user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    proxy = await _get_proxy(proxy_id, db)
+    if payload.expires_at <= datetime.now():
+        raise HTTPException(422, "代理到期时间必须晚于当前时间")
+    bound_accounts = list(await db.scalars(select(DouyinAccount).where(
+        DouyinAccount.proxy_id == proxy_id, DouyinAccount.deleted_at.is_(None),
+    )))
+    for account in bound_accounts:
+        await _ensure_proxy_account_idle(account, db)
+    proxy.domain = payload.domain.strip()
+    proxy.port = payload.port
+    proxy.username = payload.username
+    proxy.expires_at = payload.expires_at
+    if payload.password:
+        proxy.encrypted_password = encrypt_transient_secret(payload.password).encode()
+    await db.commit()
+    await db.refresh(proxy)
+    return await _proxy_response(proxy, db)
+
+
+@router.get("/proxies/{proxy_id}/accounts", response_model=list[AccountResponse])
+async def proxy_accounts(proxy_id: int, user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    await _get_proxy(proxy_id, db)
+    return list(await db.scalars(select(DouyinAccount).where(
+        DouyinAccount.proxy_id == proxy_id, DouyinAccount.deleted_at.is_(None)
+    ).order_by(DouyinAccount.id)))
+
+
+@router.post("/proxies/{proxy_id}/accounts", response_model=AccountResponse)
+async def bind_proxy_account(proxy_id: int, payload: ProxyAccountBind, user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    proxy = await _get_proxy(proxy_id, db)
+    if proxy.expires_at <= datetime.now():
+        raise HTTPException(409, "代理已过期")
+    account = await _get_douyin_account(payload.account_id, db)
+    await _ensure_proxy_account_idle(account, db)
+    account.proxy_id = proxy.id
+    db.add(AccountLog(account_id=account.id, event_type="proxy_bound", detail={"proxy_id": proxy.id, "admin_id": user.id}))
+    await db.commit()
+    await db.refresh(account)
+    return account
+
+
+@router.delete("/proxies/{proxy_id}/accounts/{account_id}", status_code=204)
+async def unbind_proxy_account(proxy_id: int, account_id: int, user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    account = await _get_douyin_account(account_id, db)
+    if account.proxy_id != proxy_id:
+        raise HTTPException(404, "账号未绑定此代理")
+    await _ensure_proxy_account_idle(account, db)
+    account.proxy_id = None
+    db.add(AccountLog(account_id=account.id, event_type="proxy_unbound", detail={"proxy_id": proxy_id, "admin_id": user.id}))
+    await db.commit()
+
+
+@router.delete("/proxies/{proxy_id}", status_code=204)
+async def delete_proxy(proxy_id: int, user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    proxy = await _get_proxy(proxy_id, db)
+    if await db.scalar(select(DouyinAccount.id).where(
+        DouyinAccount.proxy_id == proxy_id, DouyinAccount.deleted_at.is_(None)
+    ).limit(1)):
+        raise HTTPException(409, "代理仍绑定抖音账号，请先移除账号绑定")
+    proxy.deleted_at = datetime.now()
+    await db.commit()
+
+
 @router.get("/douyin-accounts", response_model=list[AccountResponse])
 async def list_accounts(user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
     result = await db.scalars(select(DouyinAccount).where(DouyinAccount.deleted_at.is_(None)).order_by(DouyinAccount.id.desc()))
@@ -563,11 +680,14 @@ async def list_accounts(user: Annotated[User, Depends(admin_user)], db: Annotate
 
 
 @router.post("/douyin-accounts", response_model=AccountResponse, status_code=201)
-async def create_account(display_name: str, user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
-    account = DouyinAccount(display_name=display_name.strip() or "未命名账号", ownership_type="platform", status="unlogged", enabled=True)
+async def create_account(display_name: str, user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)], direct_ok: bool = False):
+    proxy_id = await choose_proxy_for_new_account(db)
+    if proxy_id is None and not direct_ok:
+        raise HTTPException(409, "无可用代理，确认后可创建不使用代理的直连账号")
+    account = DouyinAccount(display_name=display_name.strip() or "未命名账号", ownership_type="platform", status="unlogged", enabled=True, proxy_id=proxy_id)
     db.add(account)
     await db.flush()
-    db.add(AccountLog(account_id=account.id, event_type="account_created", detail={"admin_id": user.id}))
+    db.add(AccountLog(account_id=account.id, event_type="account_created", detail={"admin_id": user.id, "proxy_id": proxy_id}))
     await db.commit()
     await db.refresh(account)
     return account

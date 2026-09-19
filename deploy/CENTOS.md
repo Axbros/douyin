@@ -253,6 +253,18 @@ docker compose --env-file .env -f compose.yaml exec -T mysql \
 
 每个迁移只能执行一次。当前项目还没有数据库迁移版本表，请在发布记录中记下服务器执行到哪个 SQL 文件。
 
+已有数据库升级到代理池版本时，先执行 `20260919_add_proxy_pool.sql`，再重建 API、Web 和三个浏览器 Worker：
+
+```bash
+cd /opt/douyin/deploy/centos
+docker compose --env-file .env -f compose.yaml exec -T mysql \
+  sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" douyin' \
+  < ../../backend/migrations/20260919_add_proxy_pool.sql
+docker compose --env-file .env -f compose.yaml up -d --build api web login-worker browser-worker task-worker
+```
+
+代理池统一使用带账号密码的 SOCKS5。管理员新增代理后，新建抖音账号会自动使用有余量的代理；池中无可用代理时，创建页面会要求确认直连。已绑定代理若过期，浏览器启动会报错并停止，不会回退到直连。每个浏览器 Worker 在容器内部为其账号创建一个仅监听 `127.0.0.1` 的认证转接端口，代理密码不会进入浏览器启动参数。
+
 ## 10. 数据库备份与恢复
 
 备份：

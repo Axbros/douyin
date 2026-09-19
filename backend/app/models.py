@@ -53,6 +53,16 @@ class Worker(TimestampMixin, Base):
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=3), nullable=True)
 
 
+class Proxy(TimestampMixin, Base):
+    __tablename__ = "proxies"
+    domain: Mapped[str] = mapped_column(String(255))
+    port: Mapped[int] = mapped_column(Integer)
+    username: Mapped[str] = mapped_column(String(255))
+    encrypted_password: Mapped[bytes] = mapped_column(MEDIUMBLOB)
+    expires_at: Mapped[datetime] = mapped_column(DATETIME(fsp=3))
+    max_accounts: Mapped[int] = mapped_column(Integer, default=3)
+
+
 class DouyinAccount(TimestampMixin, Base):
     __tablename__ = "douyin_accounts"
     display_name: Mapped[str] = mapped_column(String(100))
@@ -60,6 +70,7 @@ class DouyinAccount(TimestampMixin, Base):
     assigned_customer_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     ownership_type: Mapped[str] = mapped_column(String(20), default="platform")
     owner_customer_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    proxy_id: Mapped[int | None] = mapped_column(ForeignKey("proxies.id"), nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="unlogged")
     enabled: Mapped[bool] = mapped_column(default=True)
     encrypted_storage_state: Mapped[bytes | None] = mapped_column(MEDIUMBLOB, nullable=True)

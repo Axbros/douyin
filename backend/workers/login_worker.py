@@ -21,6 +21,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.core.crypto import decrypt_transient_secret, encrypt_storage_state
 from app.core.browser_preview import answer_screenshot_requests
 from app.core.database import SessionLocal, redis_client
+from app.core.proxy_pool import browser_proxy_for_account
+from app.core.proxy_tunnel import Socks5Bridge
 from app.models import AccountLoginSession, AccountLog, DouyinAccount
 from src.platforms import create_platform
 
@@ -674,10 +676,31 @@ async def run_session(session_id: int):
         browser = None
         context = None
         page = None
+        proxy_bridge = None
         try:
+            try:
+                proxy_config = await browser_proxy_for_account(db, account)
+            except RuntimeError as exc:
+                session.status = "failed"
+                session.failure_reason = str(exc)
+                account.last_error = session.failure_reason
+                db.add(AccountLog(account_id=account.id, event_type="login_failed", detail={"session_id": session.id, "reason": session.failure_reason}))
+                await db.commit()
+                await publish(session.id, "failed", reason=session.failure_reason)
+                print(f"[LoginWorker] 会话 {session_id} 代理不可用: {exc}", flush=True)
+                await p.stop()
+                return
+            if proxy_config:
+                proxy_bridge = Socks5Bridge(**proxy_config)
+                browser_proxy = await proxy_bridge.start()
+            else:
+                browser_proxy = None
             # 与原桌面程序一致：默认打开可见浏览器，让管理员直接扫码。
             # Linux 无桌面服务器由 Xvfb 提供虚拟屏幕，仍保持有界面模式以兼容页面行为。
-            browser = await p.chromium.launch(headless=os.getenv("PLAYWRIGHT_HEADLESS", "false").lower() == "true")
+            browser = await p.chromium.launch(
+                headless=os.getenv("PLAYWRIGHT_HEADLESS", "false").lower() == "true",
+                proxy=browser_proxy,
+            )
             print(f"[LoginWorker] Chromium 已启动，会话 {session_id}", flush=True)
             context = await browser.new_context()
             page = await context.new_page()
@@ -1098,6 +1121,9 @@ async def run_session(session_id: int):
                 # Chromium 尚未启动时没有可保留的浏览器，释放 Playwright 驱动。
                 await p.stop()
                 raise
+        finally:
+            if proxy_bridge:
+                await proxy_bridge.close()
 
 
 async def reconcile_interrupted_sessions():

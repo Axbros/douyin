@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class LoginRequest(BaseModel):
@@ -210,6 +210,7 @@ class AccountResponse(BaseModel):
     account_uid: str | None = None
     ownership_type: str = "platform"
     owner_customer_id: int | None = None
+    proxy_id: int | None = None
     status: str
     enabled: bool
     last_login_at: datetime | None = None
@@ -225,6 +226,88 @@ class AccountResponse(BaseModel):
 
 class DouyinAccountUpdate(BaseModel):
     display_name: str = Field(min_length=1, max_length=100)
+
+
+class ProxyWrite(BaseModel):
+    domain: str = Field(min_length=1, max_length=255)
+    port: int = Field(ge=1, le=65535)
+    username: str = Field(min_length=1, max_length=255)
+    password: str = Field(min_length=1, max_length=255)
+    expires_at: datetime
+
+    @field_validator("domain", "username")
+    @classmethod
+    def non_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("不能为空")
+        return value
+
+    @field_validator("domain")
+    @classmethod
+    def bare_domain(cls, value: str) -> str:
+        if "://" in value or "/" in value or any(ch.isspace() for ch in value):
+            raise ValueError("Domain 只填写主机名或 IP，不包含协议、路径和空格")
+        return value
+
+    @field_validator("username", "password")
+    @classmethod
+    def socks_credential_length(cls, value: str) -> str:
+        if len(value.encode()) > 255:
+            raise ValueError("SOCKS5 账号或密码不得超过 255 字节")
+        return value
+
+    @field_validator("expires_at")
+    @classmethod
+    def local_datetime(cls, value: datetime) -> datetime:
+        return value.astimezone().replace(tzinfo=None) if value.tzinfo else value
+
+
+class ProxyUpdate(BaseModel):
+    domain: str = Field(min_length=1, max_length=255)
+    port: int = Field(ge=1, le=65535)
+    username: str = Field(min_length=1, max_length=255)
+    password: str | None = Field(default=None, min_length=1, max_length=255)
+    expires_at: datetime
+
+    @field_validator("domain", "username")
+    @classmethod
+    def non_blank(cls, value: str) -> str:
+        return ProxyWrite.non_blank(value)
+
+    @field_validator("domain")
+    @classmethod
+    def bare_domain(cls, value: str) -> str:
+        return ProxyWrite.bare_domain(value)
+
+    @field_validator("username", "password")
+    @classmethod
+    def socks_credential_length(cls, value: str | None) -> str | None:
+        return ProxyWrite.socks_credential_length(value) if value is not None else None
+
+    @field_validator("expires_at")
+    @classmethod
+    def local_datetime(cls, value: datetime) -> datetime:
+        return ProxyWrite.local_datetime(value)
+
+
+class ProxyAccountBind(BaseModel):
+    account_id: int
+
+
+class ProxyResponse(BaseModel):
+    id: int
+    domain: str
+    port: int
+    username: str
+    expires_at: datetime
+    max_accounts: int
+    account_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+    deleted_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
 
 
 class AccountLogResponse(BaseModel):

@@ -11,6 +11,8 @@ from sqlalchemy import func, select
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.core.crypto import decrypt_storage_state
+from app.core.proxy_pool import browser_proxy_for_account
+from app.core.proxy_tunnel import Socks5Bridge
 from app.core.database import SessionLocal, redis_client
 from app.core.worker_registry import heartbeat_worker, mark_worker_offline, register_worker
 from app.models import AccountLog, CommentLog, DouyinAccount, Script, SensitiveWord, Task, TaskAccount, TaskScript
@@ -130,6 +132,7 @@ async def assign_replacement_account(task_id: int, failed_account_id: int) -> in
 async def run_account(task_id: int, assignment_id: int, account_id: int, live_url: str, worker_id: int):
     platform = create_platform("douyin")
     playwright = browser = context = None
+    proxy_bridge = None
     failed = False
     login_expired = False
     claimed = False
@@ -145,8 +148,17 @@ async def run_account(task_id: int, assignment_id: int, account_id: int, live_ur
             await db.commit()
             claimed = True
             state = decrypt_storage_state(account.encrypted_storage_state)
+            proxy_config = await browser_proxy_for_account(db, account)
+        if proxy_config:
+            proxy_bridge = Socks5Bridge(**proxy_config)
+            browser_proxy = await proxy_bridge.start()
+        else:
+            browser_proxy = None
         playwright = await async_playwright().start()
-        browser = await playwright.chromium.launch(headless=os.getenv("PLAYWRIGHT_HEADLESS", "false").lower() == "true")
+        browser = await playwright.chromium.launch(
+            headless=os.getenv("PLAYWRIGHT_HEADLESS", "false").lower() == "true",
+            proxy=browser_proxy,
+        )
         context = await browser.new_context(storage_state=state)
         page = await context.new_page()
         await page.goto(live_url, wait_until="domcontentloaded", timeout=30000)
@@ -280,6 +292,8 @@ async def run_account(task_id: int, assignment_id: int, account_id: int, live_ur
                 await playwright.stop()
             except Exception:
                 pass
+        if proxy_bridge:
+            await proxy_bridge.close()
         if claimed:
             async with SessionLocal() as db:
                 assignment = await db.get(TaskAccount, assignment_id)

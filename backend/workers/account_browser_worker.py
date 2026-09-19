@@ -8,6 +8,8 @@ from playwright.async_api import async_playwright
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.core.crypto import decrypt_storage_state
+from app.core.proxy_pool import browser_proxy_for_account
+from app.core.proxy_tunnel import Socks5Bridge
 from app.core.browser_preview import answer_screenshot_requests
 from app.core.database import SessionLocal, redis_client
 from app.models import AccountLog, DouyinAccount
@@ -27,6 +29,7 @@ async def run_account_browser(account_id: int, active: set[int]):
         return
     active.add(account_id)
     playwright = browser = context = None
+    proxy_bridge = None
     failed = False
     opened = False
     try:
@@ -35,9 +38,16 @@ async def run_account_browser(account_id: int, active: set[int]):
             if not account or not account.encrypted_storage_state:
                 return
             state = decrypt_storage_state(account.encrypted_storage_state)
+            proxy_config = await browser_proxy_for_account(db, account)
+        if proxy_config:
+            proxy_bridge = Socks5Bridge(**proxy_config)
+            browser_proxy = await proxy_bridge.start()
+        else:
+            browser_proxy = None
         playwright = await async_playwright().start()
         browser = await playwright.chromium.launch(
-            headless=os.getenv("PLAYWRIGHT_HEADLESS", "false").lower() == "true"
+            headless=os.getenv("PLAYWRIGHT_HEADLESS", "false").lower() == "true",
+            proxy=browser_proxy,
         )
         context = await browser.new_context(storage_state=state)
         page = await context.new_page()
@@ -87,6 +97,8 @@ async def run_account_browser(account_id: int, active: set[int]):
                 await playwright.stop()
             except Exception:
                 pass
+        if proxy_bridge:
+            await proxy_bridge.close()
         active.discard(account_id)
         async with SessionLocal() as db:
             account = await db.get(DouyinAccount, account_id)

@@ -35,6 +35,16 @@ const browserPreviewUrl = ref('')
 const browserPreviewTitle = ref('当前浏览器画面')
 const browserPreviewPath = ref('')
 const accounts = ref<any[]>([])
+const proxies = ref<any[]>([])
+const proxyKeyword = ref('')
+const filteredProxies = computed(() => proxies.value.filter(item => !proxyKeyword.value.trim() || `${item.domain} ${item.port} ${item.username}`.toLowerCase().includes(proxyKeyword.value.trim().toLowerCase())))
+const proxyDialogVisible = ref(false)
+const proxySaving = ref(false)
+const proxyForm = ref({ id: 0, domain: '', port: 1080, username: '', password: '', expires_at: '' })
+const proxyAccountsVisible = ref(false)
+const proxyAccounts = ref<any[]>([])
+const selectedProxy = ref<any>(null)
+const proxyBindAccountId = ref<number | null>(null)
 const tasks = ref<any[]>([])
 const words = ref<any[]>([])
 const taskDetailVisible = ref(false)
@@ -222,7 +232,7 @@ function assignmentStatusMeta(status: string): [string, any] {
   return ({ assigned: ['等待执行', 'info'], running: ['执行中', 'success'], removed: ['已移除', 'info'], completed: ['已完成', 'success'], error: ['异常', 'danger'] } as Record<string, [string, any]>)[status] || [status || '未知', 'info']
 }
 function matchTypeText(type: string) { return ({ contains: '包含匹配', exact: '完全匹配', regex: '正则表达式' } as Record<string, string>)[type] || type }
-function accountEventText(type: string) { return ({ account_created: '新增账号', account_updated: '编辑账号', account_enabled: '启用账号', account_disabled: '禁用账号', account_deleted: '删除账号', login_session_created: '创建扫码登录', login_success: '扫码登录成功', login_failed: '扫码登录失败', login_session_expired: '扫码会话过期', login_browser_closed: '登录浏览器已关闭', login_expired: '登录状态失效', second_verification_methods: '发现二次验证方式', verification_method_selected: '选择二次验证方式', login_password_required: '需要登录密码验证', login_password_submitted: '已提交登录密码', login_password_verify_requested: '已请求验证登录密码', second_verification_required: '需要短信二次认证', verification_code_submitted: '已提交短信验证码', browser_opened: '打开调试浏览器', browser_closed: '关闭调试浏览器', browser_error: '调试浏览器异常', task_browser_started: '进入直播间', task_browser_stopped: '退出直播间', task_error: '任务执行异常', comment_failed: '评论失败，账号异常', replacement_assigned: '作为替补加入任务', worker_lost: 'Worker 心跳丢失' } as Record<string, string>)[type] || type }
+function accountEventText(type: string) { return ({ account_created: '新增账号', account_updated: '编辑账号', account_enabled: '启用账号', account_disabled: '禁用账号', account_deleted: '删除账号', proxy_bound: '绑定代理', proxy_unbound: '移除代理', login_session_created: '创建扫码登录', login_success: '扫码登录成功', login_failed: '扫码登录失败', login_session_expired: '扫码会话过期', login_browser_closed: '登录浏览器已关闭', login_expired: '登录状态失效', second_verification_methods: '发现二次验证方式', verification_method_selected: '选择二次验证方式', login_password_required: '需要登录密码验证', login_password_submitted: '已提交登录密码', login_password_verify_requested: '已请求验证登录密码', second_verification_required: '需要短信二次认证', verification_code_submitted: '已提交短信验证码', browser_opened: '打开调试浏览器', browser_closed: '关闭调试浏览器', browser_error: '调试浏览器异常', task_browser_started: '进入直播间', task_browser_stopped: '退出直播间', task_error: '任务执行异常', comment_failed: '评论失败，账号异常', replacement_assigned: '作为替补加入任务', worker_lost: 'Worker 心跳丢失' } as Record<string, string>)[type] || type }
 function formatLogDetail(detail: any) { return detail ? Object.entries(detail).map(([key, value]) => `${key}: ${value}`).join('，') : '—' }
 function customerExpired(row: any) { return !row.expires_at || new Date(row.expires_at).getTime() <= Date.now() }
 function customerValidity(row: any) {
@@ -308,7 +318,7 @@ async function load() {
   if (role.value !== 'admin') return
   loading.value = true
   try {
-    const [accountResponse, taskResponse, wordResponse, customerResponse, scriptResponse, settingResponse, planResponse] = await Promise.all([
+    const [accountResponse, taskResponse, wordResponse, customerResponse, scriptResponse, settingResponse, planResponse, proxyResponse] = await Promise.all([
       fetch('/api/admin/douyin-accounts', { headers: authHeaders() }),
       fetch('/api/admin/tasks', { headers: authHeaders() }),
       fetch('/api/admin/sensitive-words', { headers: authHeaders() }),
@@ -316,6 +326,7 @@ async function load() {
       fetch('/api/admin/scripts', { headers: authHeaders() }),
       fetch('/api/admin/platform-settings', { headers: authHeaders() }),
       fetch('/api/admin/subscription-plans', { headers: authHeaders() }),
+      fetch('/api/admin/proxies', { headers: authHeaders() }),
     ])
     if (accountResponse.ok) accounts.value = await accountResponse.json()
     if (taskResponse.ok) tasks.value = await taskResponse.json()
@@ -324,7 +335,8 @@ async function load() {
     if (scriptResponse.ok) adminScripts.value = await scriptResponse.json()
     if (settingResponse.ok) platformSettings.value = await settingResponse.json()
     if (planResponse.ok) subscriptionPlans.value = await planResponse.json()
-    if ([accountResponse, taskResponse, wordResponse, customerResponse, scriptResponse, settingResponse, planResponse].some(response => response.status === 401)) logout()
+    if (proxyResponse.ok) proxies.value = await proxyResponse.json()
+    if ([accountResponse, taskResponse, wordResponse, customerResponse, scriptResponse, settingResponse, planResponse, proxyResponse].some(response => response.status === 401)) logout()
   } finally { loading.value = false }
 }
 
@@ -548,13 +560,60 @@ async function closeQr(done?: () => void) {
   if (typeof done === 'function') done()
 }
 
+function proxyLabel(id: number | null) { const proxy = proxies.value.find(item => item.id === id); return proxy ? `${proxy.domain}:${proxy.port}` : '直连' }
+function openProxyDialog(row?: any) {
+  proxyForm.value = row ? { id: row.id, domain: row.domain, port: row.port, username: row.username, password: '', expires_at: row.expires_at?.slice(0, 19).replace('T', ' ') || '' } : { id: 0, domain: '', port: 1080, username: '', password: '', expires_at: '' }
+  proxyDialogVisible.value = true
+}
+async function saveProxy() {
+  const form = proxyForm.value
+  if (!form.domain.trim() || !form.username.trim() || (!form.id && !form.password) || !form.expires_at) { notify('请填写代理地址、账号、密码和到期时间', 'warning'); return }
+  proxySaving.value = true
+  try {
+    const response = await fetch(form.id ? `/api/admin/proxies/${form.id}` : '/api/admin/proxies', { method: form.id ? 'PATCH' : 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ domain: form.domain.trim(), port: form.port, username: form.username.trim(), password: form.password || undefined, expires_at: form.expires_at.replace(' ', 'T') }) })
+    if (!response.ok) { notify((await response.json()).detail || '保存代理失败', 'error'); return }
+    proxyDialogVisible.value = false; proxyForm.value.password = ''; notify('代理已保存', 'success'); await load()
+  } finally { proxySaving.value = false }
+}
+async function showProxyAccounts(row: any) {
+  selectedProxy.value = row; proxyBindAccountId.value = null; proxyAccountsVisible.value = true
+  const response = await fetch(`/api/admin/proxies/${row.id}/accounts`, { headers: authHeaders() })
+  proxyAccounts.value = response.ok ? await response.json() : []
+}
+async function bindProxyAccount() {
+  if (!selectedProxy.value || !proxyBindAccountId.value) return
+  const response = await fetch(`/api/admin/proxies/${selectedProxy.value.id}/accounts`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ account_id: proxyBindAccountId.value }) })
+  if (!response.ok) { notify((await response.json()).detail || '绑定失败', 'error'); return }
+  notify('抖音账号已绑定代理', 'success'); await load(); await showProxyAccounts(selectedProxy.value)
+}
+async function unbindProxyAccount(row: any) {
+  const response = await fetch(`/api/admin/proxies/${selectedProxy.value.id}/accounts/${row.id}`, { method: 'DELETE', headers: authHeaders() })
+  if (!response.ok) { notify((await response.json()).detail || '移除失败', 'error'); return }
+  notify('账号已移除代理', 'success'); await load(); await showProxyAccounts(selectedProxy.value)
+}
+async function deleteProxy(row: any) {
+  const confirmed = await ElMessageBox.confirm(`确认删除代理 ${row.domain}:${row.port} 吗？`, '删除代理', { type: 'warning' }).catch(() => false)
+  if (!confirmed) return
+  const response = await fetch(`/api/admin/proxies/${row.id}`, { method: 'DELETE', headers: authHeaders() })
+  if (!response.ok) { notify((await response.json()).detail || '删除失败', 'error'); return }
+  notify('代理已删除', 'success'); await load()
+}
 async function addAccount() {
   if (!newAccountName.value.trim()) { notify('请输入账号名称', 'warning'); return }
   addAccountLoading.value = true
   try {
-    const response = await fetch(`/api/admin/douyin-accounts?display_name=${encodeURIComponent(newAccountName.value.trim())}`, { method: 'POST', headers: authHeaders() })
+    const url = `/api/admin/douyin-accounts?display_name=${encodeURIComponent(newAccountName.value.trim())}`
+    let response = await fetch(url, { method: 'POST', headers: authHeaders() })
+    if (response.status === 409) {
+      const detail = (await response.json()).detail || ''
+      if (!detail.includes('无可用代理')) { notify(detail || '新增失败', 'error'); return }
+      const confirmed = await ElMessageBox.confirm('代理池暂无可用额度，继续将创建不使用代理的直连账号。', '无可用代理', { type: 'warning', confirmButtonText: '直连创建' }).catch(() => false)
+      if (!confirmed) return
+      response = await fetch(`${url}&direct_ok=true`, { method: 'POST', headers: authHeaders() })
+    }
     if (!response.ok) { notify((await response.json()).detail || '新增失败', 'error'); return }
-    addAccountVisible.value = false; newAccountName.value = ''; notify('抖音账号已新增', 'success'); await load()
+    const account = await response.json()
+    addAccountVisible.value = false; newAccountName.value = ''; notify(account.proxy_id ? '抖音账号已新增并分配代理' : '抖音账号已直连创建', 'success'); await load()
   } finally { addAccountLoading.value = false }
 }
 async function wakeBrowser(id: number) {
@@ -918,7 +977,15 @@ async function addCustomerAccount() {
   if (!newCustomerAccountName.value.trim()) { notify('请输入账号名称', 'warning'); return }
   addCustomerAccountLoading.value = true
   try {
-    const response = await fetch(`/api/customer/douyin-accounts?display_name=${encodeURIComponent(newCustomerAccountName.value.trim())}`, { method: 'POST', headers: authHeaders() })
+    const url = `/api/customer/douyin-accounts?display_name=${encodeURIComponent(newCustomerAccountName.value.trim())}`
+    let response = await fetch(url, { method: 'POST', headers: authHeaders() })
+    if (response.status === 409) {
+      const detail = (await response.json()).detail || ''
+      if (!detail.includes('无可用代理')) { notify(detail || '新增账号失败', 'error'); return }
+      const confirmed = await ElMessageBox.confirm('当前没有可用代理，继续将使用服务器直连 IP 登录此账号。', '无可用代理', { type: 'warning', confirmButtonText: '直连创建' }).catch(() => false)
+      if (!confirmed) return
+      response = await fetch(`${url}&direct_ok=true`, { method: 'POST', headers: authHeaders() })
+    }
     if (!response.ok) { notify((await response.json()).detail || '新增账号失败', 'error'); return }
     const account = await response.json()
     addCustomerAccountVisible.value = false; newCustomerAccountName.value = ''; notify('账号已添加，请扫码登录', 'success'); await loadCustomer(); await qrLogin(account.id, 'customer')
@@ -1027,6 +1094,7 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
           <el-menu-item index="settings"><el-icon><Setting /></el-icon><span>平台配置</span></el-menu-item>
           <el-menu-item index="customers"><el-icon><UserFilled /></el-icon><span>客户管理</span></el-menu-item>
           <el-menu-item index="accounts"><el-icon><Avatar /></el-icon><span>抖音账号</span></el-menu-item>
+          <el-menu-item index="proxies"><el-icon><Connection /></el-icon><span>代理池</span></el-menu-item>
           <el-menu-item index="scripts"><el-icon><ChatDotRound /></el-icon><span>话术审核</span></el-menu-item>
           <el-menu-item index="tasks"><el-icon><Operation /></el-icon><span>直播任务</span></el-menu-item>
           <el-menu-item index="words"><el-icon><Warning /></el-icon><span>敏感词管理</span></el-menu-item>
@@ -1079,6 +1147,7 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
             <el-table v-loading="loading" :data="paginatedAccounts" border stripe style="width: 100%" empty-text="暂无数据">
               <el-table-column type="index" label="序号" width="70" :index="accountTableIndex" /><el-table-column prop="display_name" label="账号名称" min-width="150" /><el-table-column label="归属" width="120"><template #default="{ row }"><el-tag :type="row.ownership_type === 'platform' ? 'primary' : 'success'">{{ row.ownership_type === 'platform' ? '平台账号' : '客户自有' }}</el-tag></template></el-table-column>
               <el-table-column label="状态" width="130"><template #default="{ row }"><el-tag :type="accountStatusMeta(row.status)[1]">{{ accountStatusMeta(row.status)[0] }}</el-tag></template></el-table-column>
+              <el-table-column label="代理" min-width="170"><template #default="{ row }">{{ proxyLabel(row.proxy_id) }}</template></el-table-column>
               <el-table-column label="当前任务" width="110"><template #default="{ row }">{{ row.current_task_id ? '执行中' : '—' }}</template></el-table-column>
               <el-table-column label="异常/风控信息" min-width="190" show-overflow-tooltip><template #default="{ row }">{{ row.risk_message || row.last_error || '—' }}</template></el-table-column>
               <el-table-column label="登录成功时间" min-width="180"><template #default="{ row }">{{ formatDate(row.last_login_at) }}</template></el-table-column>
@@ -1086,6 +1155,14 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
               <el-table-column label="操作" fixed="right" width="520"><template #default="{ row }"><el-button link type="primary" @click="openEditAccount(row)">编辑</el-button><el-button link type="primary" @click="showAccountLogs(row)">日志</el-button><el-button v-if="!['busy', 'paused'].includes(row.status)" link type="primary" @click="qrLogin(row.id)">扫码登录</el-button><el-button v-if="row.status === 'available'" link type="primary" :loading="wakeLoadingId === row.id" @click="wakeBrowser(row.id)">调试浏览器</el-button><el-button v-if="row.status === 'browser_open'" link type="primary" @click="showAccountBrowserPreview(row)">查看画面</el-button><el-button v-if="row.status === 'browser_open'" link type="warning" @click="closeBrowser(row.id)">关闭浏览器</el-button><el-button v-if="!row.enabled || ['error', 'risk', 'risk_controlled'].includes(row.status)" link type="success" @click="setAccountEnabled(row, true)">恢复可用</el-button><el-button v-else link type="warning" @click="setAccountEnabled(row, false)">禁用</el-button><el-button link type="danger" @click="deleteDouyinAccount(row)">删除</el-button></template></el-table-column>
             </el-table>
             <div class="pagination-row"><el-pagination background layout="total, sizes, prev, pager, next, jumper" :total="filteredAccounts.length" v-model:current-page="accountPage" v-model:page-size="accountPageSize" :page-sizes="[10, 20, 50, 100]" /></div>
+          </el-card>
+        </template>
+
+        <template v-else-if="active === 'proxies'">
+          <el-card shadow="never" style="margin-bottom: 12px"><div class="query-title">查询条件</div><el-form inline class="queryForm"><el-form-item label="代理"><el-input v-model="proxyKeyword" clearable placeholder="Domain / Port / 账号" :prefix-icon="Search" /></el-form-item><el-form-item><el-button type="primary" @click="load">刷新</el-button><el-button @click="proxyKeyword = ''">重置</el-button></el-form-item></el-form></el-card>
+          <el-card shadow="never">
+            <div class="table-toolbar"><div class="table-title">SOCKS5 代理列表</div><el-button type="primary" size="small" @click="openProxyDialog()">新增代理</el-button></div>
+            <el-table :data="filteredProxies" border stripe empty-text="暂无代理"><el-table-column type="index" label="序号" width="70" /><el-table-column prop="domain" label="Domain" min-width="180" /><el-table-column prop="port" label="Port" width="100" /><el-table-column prop="username" label="账号" min-width="150" /><el-table-column label="到期日期" min-width="180"><template #default="{ row }">{{ formatDate(row.expires_at) }}</template></el-table-column><el-table-column label="状态" width="110"><template #default="{ row }"><el-tag :type="new Date(row.expires_at).getTime() > Date.now() ? 'success' : 'danger'">{{ new Date(row.expires_at).getTime() > Date.now() ? '可用' : '已到期' }}</el-tag></template></el-table-column><el-table-column label="已绑定/默认容量" width="140"><template #default="{ row }">{{ row.account_count }}/{{ row.max_accounts }}</template></el-table-column><el-table-column label="操作" width="240" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="showProxyAccounts(row)">抖音号</el-button><el-button link type="primary" @click="openProxyDialog(row)">编辑</el-button><el-button link type="danger" @click="deleteProxy(row)">删除</el-button></template></el-table-column></el-table>
           </el-card>
         </template>
 
@@ -1176,6 +1253,8 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
         </el-tabs>
       </div>
     </el-dialog>
+    <el-dialog v-model="proxyDialogVisible" :title="proxyForm.id ? '编辑代理' : '新增代理'" width="500px" align-center><el-form label-position="top"><el-form-item label="Domain"><el-input v-model="proxyForm.domain" placeholder="proxy.example.com" /></el-form-item><el-form-item label="Port"><el-input-number v-model="proxyForm.port" :min="1" :max="65535" /></el-form-item><el-form-item label="账号"><el-input v-model="proxyForm.username" autocomplete="off" /></el-form-item><el-form-item :label="proxyForm.id ? '密码（留空表示不修改）' : '密码'"><el-input v-model="proxyForm.password" type="password" show-password autocomplete="new-password" /></el-form-item><el-form-item label="到期日期"><el-date-picker v-model="proxyForm.expires_at" type="datetime" value-format="YYYY-MM-DD HH:mm:ss" placeholder="选择到期时间" style="width:100%" /></el-form-item></el-form><template #footer><el-button @click="proxyDialogVisible = false">取消</el-button><el-button type="primary" :loading="proxySaving" @click="saveProxy">保存</el-button></template></el-dialog>
+    <el-dialog v-model="proxyAccountsVisible" :title="`代理 ${selectedProxy?.domain || ''}:${selectedProxy?.port || ''} · 抖音号`" width="min(92vw, 760px)" align-center><el-alert v-if="proxyAccounts.length >= (selectedProxy?.max_accounts || 3)" title="已达到默认 3 个账号容量；管理员仍可手动添加" type="warning" :closable="false" style="margin-bottom:12px" /><div class="table-toolbar"><el-select v-model="proxyBindAccountId" filterable clearable placeholder="选择未绑定或需迁移的账号" style="width:300px"><el-option v-for="account in accounts.filter(item => item.proxy_id !== selectedProxy?.id && !['busy', 'paused', 'browser_open'].includes(item.status))" :key="account.id" :label="account.display_name" :value="account.id" /></el-select><el-button type="primary" :disabled="!proxyBindAccountId" @click="bindProxyAccount">手动添加</el-button></div><el-table :data="proxyAccounts" border stripe empty-text="暂无绑定账号"><el-table-column type="index" label="序号" width="70" /><el-table-column prop="display_name" label="账号名称" min-width="180" /><el-table-column label="归属" width="110"><template #default="{ row }">{{ row.ownership_type === 'customer' ? '客户' : '平台' }}</template></el-table-column><el-table-column label="状态" width="130"><template #default="{ row }">{{ accountStatusMeta(row.status)[0] }}</template></el-table-column><el-table-column label="操作" width="100"><template #default="{ row }"><el-button link type="danger" @click="unbindProxyAccount(row)">移除</el-button></template></el-table-column></el-table></el-dialog>
     <el-dialog v-model="accountEditVisible" title="编辑抖音账号" width="460px" align-center><el-form label-position="left" label-width="90px"><el-form-item label="账号名称"><el-input v-model="accountEditForm.display_name" maxlength="100" /></el-form-item></el-form><template #footer><el-button @click="accountEditVisible = false">取消</el-button><el-button type="primary" :loading="accountEditLoading" @click="saveAccount">保存</el-button></template></el-dialog>
     <el-dialog v-model="accountLogVisible" :title="`${accountLogTarget?.display_name || '抖音账号'} · 账号日志`" width="min(94vw, 1080px)" align-center>
       <el-tabs v-loading="accountLogLoading">

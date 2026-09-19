@@ -102,6 +102,22 @@ CREATE TABLE workers (
     KEY idx_workers_deleted_at (deleted_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
+-- SOCKS5 代理池；密码由应用层加密后写入。
+CREATE TABLE proxies (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    domain VARCHAR(255) NOT NULL,
+    port INT NOT NULL,
+    username VARCHAR(255) NOT NULL,
+    encrypted_password MEDIUMBLOB NOT NULL,
+    expires_at DATETIME(3) NOT NULL,
+    max_accounts INT NOT NULL DEFAULT 3,
+    created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    deleted_at DATETIME(3) NULL,
+    PRIMARY KEY (id),
+    KEY idx_proxies_available (deleted_at, expires_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
 -- 平台账号与客户自有账号。storage_state 必须由应用层加密后写入。
 CREATE TABLE douyin_accounts (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -110,6 +126,7 @@ CREATE TABLE douyin_accounts (
     assigned_customer_id BIGINT UNSIGNED NULL,
     ownership_type VARCHAR(20) NOT NULL DEFAULT 'platform' COMMENT 'platform/customer',
     owner_customer_id BIGINT UNSIGNED NULL,
+    proxy_id BIGINT UNSIGNED NULL,
     status VARCHAR(30) NOT NULL DEFAULT 'unlogged' COMMENT 'unlogged/available/assigned/running/risk_controlled/error/disabled',
     enabled TINYINT(1) NOT NULL DEFAULT 1,
     encrypted_storage_state MEDIUMBLOB NULL,
@@ -129,10 +146,12 @@ CREATE TABLE douyin_accounts (
     KEY idx_douyin_accounts_available (enabled, status, last_heartbeat_at),
     KEY idx_douyin_accounts_customer (assigned_customer_id),
     KEY idx_douyin_accounts_owner (owner_customer_id, ownership_type, deleted_at),
+    KEY idx_douyin_accounts_proxy (proxy_id),
     KEY idx_douyin_accounts_worker (current_worker_id),
     KEY idx_douyin_accounts_deleted_at (deleted_at),
     CONSTRAINT fk_douyin_account_customer FOREIGN KEY (assigned_customer_id) REFERENCES users(id),
     CONSTRAINT fk_douyin_accounts_owner FOREIGN KEY (owner_customer_id) REFERENCES users(id),
+    CONSTRAINT fk_douyin_accounts_proxy FOREIGN KEY (proxy_id) REFERENCES proxies(id),
     CONSTRAINT fk_douyin_account_worker FOREIGN KEY (current_worker_id) REFERENCES workers(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 

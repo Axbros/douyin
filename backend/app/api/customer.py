@@ -135,7 +135,8 @@ async def owned_account_quota(user: Annotated[User, Depends(customer_user)], db:
 
 
 @router.post("/douyin-accounts", response_model=AccountResponse, status_code=201)
-async def create_owned_account(display_name: str, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+async def create_owned_account(display_name: str, user: Annotated[User, Depends(customer_user)], db: Annotated[AsyncSession, Depends(get_db)], direct_ok: bool = False):
+    from app.core.proxy_pool import choose_proxy_for_new_account
     locked_user = await db.scalar(select(User).where(User.id == user.id).with_for_update())
     plan = await get_customer_plan(db, locked_user)
     used = await db.scalar(select(func.count(DouyinAccount.id)).where(
@@ -145,10 +146,13 @@ async def create_owned_account(display_name: str, user: Annotated[User, Depends(
     quota = plan.base_douyin_account_quota + locked_user.extra_douyin_account_quota
     if used >= quota:
         raise HTTPException(409, f"自有抖音账号额度已用完（{used}/{quota}），请购买额外额度")
+    proxy_id = await choose_proxy_for_new_account(db)
+    if proxy_id is None and not direct_ok:
+        raise HTTPException(409, "无可用代理，确认后可创建不使用代理的直连账号")
     account = DouyinAccount(display_name=display_name.strip() or "我的抖音账号", ownership_type="customer",
-                            owner_customer_id=user.id, status="unlogged", enabled=True)
+                            owner_customer_id=user.id, status="unlogged", enabled=True, proxy_id=proxy_id)
     db.add(account); await db.flush()
-    db.add(AccountLog(account_id=account.id, event_type="account_created", detail={"customer_id": user.id, "ownership_type": "customer"}))
+    db.add(AccountLog(account_id=account.id, event_type="account_created", detail={"customer_id": user.id, "ownership_type": "customer", "proxy_id": proxy_id}))
     await db.commit(); await db.refresh(account)
     return account
 
