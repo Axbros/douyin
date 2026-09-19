@@ -31,7 +31,10 @@ case "${1:-}" in
     compose down
     ;;
   restart)
-    compose restart
+    # `compose restart` only restarts existing containers and does not restore
+    # missing dependencies or wait for MySQL/Redis health before workers start.
+    compose up -d --no-build --force-recreate --scale task-worker="$(task_worker_processes)"
+    compose ps
     ;;
   status)
     compose ps

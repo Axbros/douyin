@@ -229,7 +229,7 @@ Chromium 以 `headless=false` 运行，画面由 Xvfb 虚拟屏幕承载，因�
 ./manage.sh logs login-worker      # 扫码登录日志
 ./manage.sh logs browser-worker    # 账号浏览器日志
 ./manage.sh logs task-worker       # 评论任务日志
-./manage.sh restart                # 重启全部服务
+./manage.sh restart                # 重新创建并启动全部服务，等待 MySQL/Redis 健康后再启动 Worker
 ./manage.sh stop                   # 停止并保留数据
 ./manage.sh update                 # 按 .env 中的源拉取 main 并重新构建
 ./start-cn.sh                      # 国内镜像重新构建并启动
