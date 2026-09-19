@@ -20,8 +20,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.database import redis_client
 from app.core.browser_preview import screenshot_request_key, screenshot_response_key
-from app.core.crypto import encrypt_transient_secret
+from app.core.crypto import decrypt_transient_secret, encrypt_transient_secret
 from app.core.proxy_pool import choose_proxy_for_new_account
+from app.core.proxy_speed import measure_proxy
 from app.core.platform_settings import get_platform_settings, update_platform_settings
 from app.core.security import hash_password
 from app.core.task_lifecycle import delete_stopped_task, restart_stopped_task
@@ -45,6 +46,7 @@ from app.schemas import (
     LoginVerificationMethodRequest,
     ProxyAccountBind,
     ProxyResponse,
+    ProxyTestResponse,
     ProxyUpdate,
     ProxyWrite,
     PlatformSettingsResponse,
@@ -62,6 +64,11 @@ from app.schemas import (
 )
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
+PROXY_TEST_SEMAPHORE = asyncio.Semaphore(3)
+
+
+def proxy_test_key(proxy_id: int) -> str:
+    return f"douyin:proxy:test:{proxy_id}"
 ACCOUNT_BROWSER_WORKER_HEARTBEAT_KEY = "douyin:account-browser-worker:heartbeat"
 WORKER_HEARTBEAT_KEYS = {
     "扫码登录 Worker": "douyin:login-worker:heartbeat",
@@ -573,6 +580,9 @@ async def _proxy_response(proxy: Proxy, db: AsyncSession) -> dict:
     result["account_count"] = await db.scalar(select(func.count(DouyinAccount.id)).where(
         DouyinAccount.proxy_id == proxy.id, DouyinAccount.deleted_at.is_(None)
     )) or 0
+    cached = await redis_client.get(proxy_test_key(proxy.id))
+    if cached:
+        result["test_result"] = json.loads(cached)
     return result
 
 
@@ -625,8 +635,22 @@ async def update_proxy(proxy_id: int, payload: ProxyUpdate, user: Annotated[User
     if payload.password:
         proxy.encrypted_password = encrypt_transient_secret(payload.password).encode()
     await db.commit()
+    await redis_client.delete(proxy_test_key(proxy_id))
     await db.refresh(proxy)
     return await _proxy_response(proxy, db)
+
+
+@router.post("/proxies/{proxy_id}/test", response_model=ProxyTestResponse)
+async def test_proxy(proxy_id: int, user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    proxy = await _get_proxy(proxy_id, db)
+    config = {
+        "host": proxy.domain, "port": proxy.port, "username": proxy.username,
+        "password": decrypt_transient_secret(proxy.encrypted_password.decode()),
+    }
+    async with PROXY_TEST_SEMAPHORE:
+        result = await measure_proxy(config)
+    await redis_client.set(proxy_test_key(proxy_id), json.dumps(result, ensure_ascii=False), ex=86400)
+    return result
 
 
 @router.get("/proxies/{proxy_id}/accounts", response_model=list[AccountResponse])
@@ -671,6 +695,7 @@ async def delete_proxy(proxy_id: int, user: Annotated[User, Depends(admin_user)]
         raise HTTPException(409, "代理仍绑定抖音账号，请先移除账号绑定")
     proxy.deleted_at = datetime.now()
     await db.commit()
+    await redis_client.delete(proxy_test_key(proxy_id))
 
 
 @router.get("/douyin-accounts", response_model=list[AccountResponse])

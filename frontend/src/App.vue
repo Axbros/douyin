@@ -40,6 +40,7 @@ const proxyKeyword = ref('')
 const filteredProxies = computed(() => proxies.value.filter(item => !proxyKeyword.value.trim() || `${item.domain} ${item.port} ${item.username}`.toLowerCase().includes(proxyKeyword.value.trim().toLowerCase())))
 const proxyDialogVisible = ref(false)
 const proxySaving = ref(false)
+const proxyTestingId = ref<number | null>(null)
 const proxyForm = ref({ id: 0, domain: '', port: 1080, username: '', password: '', expires_at: '' })
 const proxyAccountsVisible = ref(false)
 const proxyAccounts = ref<any[]>([])
@@ -597,6 +598,16 @@ async function deleteProxy(row: any) {
   const response = await fetch(`/api/admin/proxies/${row.id}`, { method: 'DELETE', headers: authHeaders() })
   if (!response.ok) { notify((await response.json()).detail || '删除失败', 'error'); return }
   notify('代理已删除', 'success'); await load()
+}
+async function testProxy(row: any) {
+  proxyTestingId.value = row.id
+  try {
+    const response = await fetch(`/api/admin/proxies/${row.id}/test`, { method: 'POST', headers: authHeaders() })
+    if (!response.ok) { notify((await response.json()).detail || '代理测速失败', 'error'); return }
+    row.test_result = await response.json()
+    notify(row.test_result.reachable ? '代理可连接抖音，测速结果已更新' : `代理连接失败：${row.test_result.error || '未知原因'}`, row.test_result.reachable ? 'success' : 'error')
+  } catch { notify('代理测速请求失败', 'error') }
+  finally { proxyTestingId.value = null }
 }
 async function addAccount() {
   if (!newAccountName.value.trim()) { notify('请输入账号名称', 'warning'); return }
@@ -1161,8 +1172,21 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
         <template v-else-if="active === 'proxies'">
           <el-card shadow="never" style="margin-bottom: 12px"><div class="query-title">查询条件</div><el-form inline class="queryForm"><el-form-item label="代理"><el-input v-model="proxyKeyword" clearable placeholder="Domain / Port / 账号" :prefix-icon="Search" /></el-form-item><el-form-item><el-button type="primary" @click="load">刷新</el-button><el-button @click="proxyKeyword = ''">重置</el-button></el-form-item></el-form></el-card>
           <el-card shadow="never">
-            <div class="table-toolbar"><div class="table-title">SOCKS5 代理列表</div><el-button type="primary" size="small" @click="openProxyDialog()">新增代理</el-button></div>
-            <el-table :data="filteredProxies" border stripe empty-text="暂无代理"><el-table-column type="index" label="序号" width="70" /><el-table-column prop="domain" label="Domain" min-width="180" /><el-table-column prop="port" label="Port" width="100" /><el-table-column prop="username" label="账号" min-width="150" /><el-table-column label="到期日期" min-width="180"><template #default="{ row }">{{ formatDate(row.expires_at) }}</template></el-table-column><el-table-column label="状态" width="110"><template #default="{ row }"><el-tag :type="new Date(row.expires_at).getTime() > Date.now() ? 'success' : 'danger'">{{ new Date(row.expires_at).getTime() > Date.now() ? '可用' : '已到期' }}</el-tag></template></el-table-column><el-table-column label="已绑定/默认容量" width="140"><template #default="{ row }">{{ row.account_count }}/{{ row.max_accounts }}</template></el-table-column><el-table-column label="操作" width="240" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="showProxyAccounts(row)">抖音号</el-button><el-button link type="primary" @click="openProxyDialog(row)">编辑</el-button><el-button link type="danger" @click="deleteProxy(row)">删除</el-button></template></el-table-column></el-table>
+            <div class="table-toolbar"><div class="table-title">SOCKS5 代理列表</div><div class="record-total">下载测速：Cloudflare 1 MiB 样本，仅供参考</div><el-button type="primary" size="small" @click="openProxyDialog()">新增代理</el-button></div>
+            <el-table :data="filteredProxies" border stripe empty-text="暂无代理">
+              <el-table-column type="index" label="序号" width="70" />
+              <el-table-column prop="domain" label="Domain" min-width="180" />
+              <el-table-column prop="port" label="Port" width="100" />
+              <el-table-column prop="username" label="账号" min-width="130" />
+              <el-table-column label="到期日期" min-width="180"><template #default="{ row }">{{ formatDate(row.expires_at) }}</template></el-table-column>
+              <el-table-column label="状态" width="100"><template #default="{ row }"><el-tag :type="new Date(row.expires_at).getTime() > Date.now() ? 'success' : 'danger'">{{ new Date(row.expires_at).getTime() > Date.now() ? '可用' : '已到期' }}</el-tag></template></el-table-column>
+              <el-table-column label="抖音连通" width="115"><template #default="{ row }"><span v-if="!row.test_result">未检测</span><el-tooltip v-else :content="row.test_result.error || '已通过代理访问抖音 HTTPS'" placement="top"><el-tag :type="row.test_result.reachable ? 'success' : 'danger'">{{ row.test_result.reachable ? '正常' : '失败' }}</el-tag></el-tooltip></template></el-table-column>
+              <el-table-column label="响应耗时" width="120"><template #default="{ row }">{{ row.test_result?.latency_ms == null ? '—' : `${row.test_result.latency_ms} ms` }}</template></el-table-column>
+              <el-table-column label="下载速度" width="140"><template #default="{ row }"><span v-if="row.test_result?.download_mbps != null">{{ row.test_result.download_mbps }} Mbps</span><el-tooltip v-else-if="row.test_result?.speed_error" :content="row.test_result.speed_error" placement="top"><el-tag type="warning">测速失败</el-tag></el-tooltip><span v-else>—</span></template></el-table-column>
+              <el-table-column label="检测时间" min-width="180"><template #default="{ row }">{{ formatDate(row.test_result?.checked_at) }}</template></el-table-column>
+              <el-table-column label="已绑定/默认容量" width="140"><template #default="{ row }">{{ row.account_count }}/{{ row.max_accounts }}</template></el-table-column>
+              <el-table-column label="操作" width="295" fixed="right"><template #default="{ row }"><el-button link type="primary" :loading="proxyTestingId === row.id" @click="testProxy(row)">测速</el-button><el-button link type="primary" @click="showProxyAccounts(row)">抖音号</el-button><el-button link type="primary" @click="openProxyDialog(row)">编辑</el-button><el-button link type="danger" @click="deleteProxy(row)">删除</el-button></template></el-table-column>
+            </el-table>
           </el-card>
         </template>
 

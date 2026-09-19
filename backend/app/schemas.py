@@ -295,6 +295,16 @@ class ProxyAccountBind(BaseModel):
     account_id: int
 
 
+class ProxyTestResponse(BaseModel):
+    reachable: bool
+    latency_ms: float | None = None
+    download_mbps: float | None = None
+    downloaded_bytes: int = 0
+    error: str | None = None
+    speed_error: str | None = None
+    checked_at: datetime
+
+
 class ProxyResponse(BaseModel):
     id: int
     domain: str
@@ -303,6 +313,7 @@ class ProxyResponse(BaseModel):
     expires_at: datetime
     max_accounts: int
     account_count: int = 0
+    test_result: ProxyTestResponse | None = None
     created_at: datetime
     updated_at: datetime
     deleted_at: datetime | None = None
