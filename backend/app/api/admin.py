@@ -6,7 +6,7 @@ import re
 import socket
 import sys
 from time import perf_counter
-from typing import Annotated
+from typing import Annotated, Literal
 
 import psutil
 
@@ -577,6 +577,25 @@ async def _get_proxy(proxy_id: int, db: AsyncSession) -> Proxy:
     return proxy
 
 
+async def _get_available_proxy(proxy_id: int, db: AsyncSession) -> Proxy:
+    proxy = await db.scalar(select(Proxy).where(
+        Proxy.id == proxy_id, Proxy.deleted_at.is_(None),
+    ).with_for_update())
+    if not proxy:
+        raise HTTPException(404, "代理不存在")
+    if proxy.expires_at <= datetime.now():
+        raise HTTPException(409, "代理已过期")
+    bound_ids = list(await db.scalars(select(DouyinAccount.id).where(
+        DouyinAccount.proxy_id == proxy_id, DouyinAccount.deleted_at.is_(None),
+    ).with_for_update()))
+    if len(bound_ids) >= proxy.max_accounts:
+        raise HTTPException(409, "代理绑定账号数已达上限")
+    cached = await redis_client.get(proxy_test_key(proxy_id))
+    if cached and json.loads(cached).get("reachable") is False:
+        raise HTTPException(409, "代理最近一次测速未连通，请先重新测速")
+    return proxy
+
+
 async def _proxy_response(proxy: Proxy, db: AsyncSession) -> dict:
     result = ProxyResponse.model_validate(proxy).model_dump()
     result["account_count"] = await db.scalar(select(func.count(DouyinAccount.id)).where(
@@ -585,6 +604,13 @@ async def _proxy_response(proxy: Proxy, db: AsyncSession) -> dict:
     cached = await redis_client.get(proxy_test_key(proxy.id))
     if cached:
         result["test_result"] = json.loads(cached)
+    if proxy.expires_at <= datetime.now():
+        result["unavailable_reason"] = "已过期"
+    elif result["account_count"] >= proxy.max_accounts:
+        result["unavailable_reason"] = "已满额"
+    elif result["test_result"] and result["test_result"].get("reachable") is False:
+        result["unavailable_reason"] = "测速未连通"
+    result["available"] = result["unavailable_reason"] is None
     return result
 
 
@@ -707,14 +733,26 @@ async def list_accounts(user: Annotated[User, Depends(admin_user)], db: Annotate
 
 
 @router.post("/douyin-accounts", response_model=AccountResponse, status_code=201)
-async def create_account(display_name: str, user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)], direct_ok: bool = False):
-    proxy_id = await choose_proxy_for_new_account(db)
-    if proxy_id is None and not direct_ok:
-        raise HTTPException(409, "无可用代理，确认后可创建不使用代理的直连账号")
-    account = DouyinAccount(display_name=display_name.strip() or "未命名账号", ownership_type="platform", status="unlogged", enabled=True, proxy_id=proxy_id)
+async def create_account(display_name: str, user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)], direct_ok: bool = False, proxy_mode: Literal["auto", "direct", "proxy"] = "auto", proxy_id: int | None = None):
+    if proxy_mode == "direct":
+        if proxy_id is not None:
+            raise HTTPException(422, "直连账号不能选择代理")
+        selected_proxy_id = None
+    elif proxy_mode == "proxy":
+        if proxy_id is None:
+            raise HTTPException(422, "请选择代理")
+        await _get_available_proxy(proxy_id, db)
+        selected_proxy_id = proxy_id
+    else:
+        if proxy_id is not None:
+            raise HTTPException(422, "指定代理时请选择代理模式")
+        selected_proxy_id = await choose_proxy_for_new_account(db)
+        if selected_proxy_id is None and not direct_ok:
+            raise HTTPException(409, "无可用代理，确认后可创建不使用代理的直连账号")
+    account = DouyinAccount(display_name=display_name.strip() or "未命名账号", ownership_type="platform", status="unlogged", enabled=True, proxy_id=selected_proxy_id)
     db.add(account)
     await db.flush()
-    db.add(AccountLog(account_id=account.id, event_type="account_created", detail={"admin_id": user.id, "proxy_id": proxy_id}))
+    db.add(AccountLog(account_id=account.id, event_type="account_created", detail={"admin_id": user.id, "proxy_id": selected_proxy_id}))
     await db.commit()
     await db.refresh(account)
     return account
@@ -736,8 +774,26 @@ async def update_account(account_id: int, payload: DouyinAccountUpdate, user: An
     if not display_name:
         raise HTTPException(422, "账号名称不能为空")
     old_name = account.display_name
+    old_proxy_id = account.proxy_id
+    if payload.proxy_mode is None and "proxy_id" in payload.model_fields_set:
+        raise HTTPException(422, "修改代理时请选择连接方式")
+    if payload.proxy_mode == "direct":
+        if payload.proxy_id is not None:
+            raise HTTPException(422, "直连账号不能选择代理")
+        next_proxy_id = None
+    elif payload.proxy_mode == "proxy":
+        if payload.proxy_id is None:
+            raise HTTPException(422, "请选择代理")
+        next_proxy_id = payload.proxy_id
+    else:
+        next_proxy_id = old_proxy_id
+    if next_proxy_id != old_proxy_id:
+        await _ensure_proxy_account_idle(account, db)
+        if next_proxy_id is not None:
+            await _get_available_proxy(next_proxy_id, db)
+        account.proxy_id = next_proxy_id
     account.display_name = display_name
-    db.add(AccountLog(account_id=account.id, event_type="account_updated", detail={"old_name": old_name, "new_name": display_name, "admin_id": user.id}))
+    db.add(AccountLog(account_id=account.id, event_type="account_updated", detail={"old_name": old_name, "new_name": display_name, "old_proxy_id": old_proxy_id, "proxy_id": next_proxy_id, "admin_id": user.id}))
     await db.commit()
     await db.refresh(account)
     return account

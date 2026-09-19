@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -226,6 +227,8 @@ class AccountResponse(BaseModel):
 
 class DouyinAccountUpdate(BaseModel):
     display_name: str = Field(min_length=1, max_length=100)
+    proxy_mode: Literal["direct", "proxy"] | None = None
+    proxy_id: int | None = None
 
 
 class ProxyWrite(BaseModel):
@@ -327,6 +330,8 @@ class ProxyResponse(BaseModel):
     max_accounts: int
     account_count: int = 0
     test_result: ProxyTestResponse | None = None
+    available: bool = True
+    unavailable_reason: str | None = None
     created_at: datetime
     updated_at: datetime
     deleted_at: datetime | None = None

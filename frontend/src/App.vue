@@ -95,9 +95,11 @@ const profileVisible = ref(false)
 const addAccountVisible = ref(false)
 const addAccountLoading = ref(false)
 const newAccountName = ref('')
+const newAccountProxyMode = ref<'direct' | 'proxy'>('direct')
+const newAccountProxyId = ref<number | null>(null)
 const accountEditVisible = ref(false)
 const accountEditLoading = ref(false)
-const accountEditForm = ref({ id: 0, display_name: '' })
+const accountEditForm = ref<{ id: number; display_name: string; proxy_mode: 'direct' | 'proxy'; proxy_id: number | null }>({ id: 0, display_name: '', proxy_mode: 'direct', proxy_id: null })
 const accountLogVisible = ref(false)
 const accountLogLoading = ref(false)
 const accountLogs = ref<any[]>([])
@@ -719,22 +721,33 @@ async function testProxy(row: any) {
   } catch { notify('代理测速请求失败', 'error') }
   finally { proxyTestingId.value = null }
 }
+async function refreshAccountProxies() {
+  try {
+    const response = await fetch('/api/admin/proxies', { headers: authHeaders() })
+    if (response.ok) proxies.value = await response.json()
+    else notify((await response.json()).detail || '获取代理列表失败', 'error')
+  } catch { notify('获取代理列表失败', 'error') }
+}
+function proxyOptionLabel(proxy: any) {
+  return `${proxy.domain}:${proxy.port}（${proxy.account_count}/${proxy.max_accounts}）${proxy.unavailable_reason ? ` · ${proxy.unavailable_reason}` : ''}`
+}
+function openAddAccount() {
+  newAccountName.value = ''
+  newAccountProxyMode.value = 'direct'
+  newAccountProxyId.value = null
+  addAccountVisible.value = true
+  void refreshAccountProxies()
+}
 async function addAccount() {
   if (!newAccountName.value.trim()) { notify('请输入账号名称', 'warning'); return }
+  if (newAccountProxyMode.value === 'proxy' && !newAccountProxyId.value) { notify('请选择代理', 'warning'); return }
   addAccountLoading.value = true
   try {
-    const url = `/api/admin/douyin-accounts?display_name=${encodeURIComponent(newAccountName.value.trim())}`
-    let response = await fetch(url, { method: 'POST', headers: authHeaders() })
-    if (response.status === 409) {
-      const detail = (await response.json()).detail || ''
-      if (!detail.includes('无可用代理')) { notify(detail || '新增失败', 'error'); return }
-      const confirmed = await ElMessageBox.confirm('代理池暂无可用额度，继续将创建不使用代理的直连账号。', '无可用代理', { type: 'warning', confirmButtonText: '直连创建' }).catch(() => false)
-      if (!confirmed) return
-      response = await fetch(`${url}&direct_ok=true`, { method: 'POST', headers: authHeaders() })
-    }
-    if (!response.ok) { notify((await response.json()).detail || '新增失败', 'error'); return }
-    const account = await response.json()
-    addAccountVisible.value = false; newAccountName.value = ''; notify(account.proxy_id ? '抖音账号已新增并分配代理' : '抖音账号已直连创建', 'success'); await load()
+    const params = new URLSearchParams({ display_name: newAccountName.value.trim(), proxy_mode: newAccountProxyMode.value })
+    if (newAccountProxyMode.value === 'proxy') params.set('proxy_id', String(newAccountProxyId.value))
+    const response = await fetch(`/api/admin/douyin-accounts?${params}`, { method: 'POST', headers: authHeaders() })
+    if (!response.ok) { notify((await response.json()).detail || '新增失败', 'error'); await refreshAccountProxies(); return }
+    addAccountVisible.value = false; notify('抖音账号已新增', 'success'); await load()
   } finally { addAccountLoading.value = false }
 }
 async function wakeBrowser(id: number) {
@@ -758,14 +771,19 @@ async function closeBrowser(id: number) {
     notify('浏览器关闭指令已发送', 'success'); window.setTimeout(load, 800)
   } else notify('关闭失败', 'error')
 }
-function openEditAccount(row: any) { accountEditForm.value = { id: row.id, display_name: row.display_name }; accountEditVisible.value = true }
+function openEditAccount(row: any) {
+  accountEditForm.value = { id: row.id, display_name: row.display_name, proxy_mode: row.proxy_id ? 'proxy' : 'direct', proxy_id: row.proxy_id || null }
+  accountEditVisible.value = true
+  void refreshAccountProxies()
+}
 async function saveAccount() {
   if (!accountEditForm.value.display_name.trim()) { notify('请输入账号名称', 'warning'); return }
+  if (accountEditForm.value.proxy_mode === 'proxy' && !accountEditForm.value.proxy_id) { notify('请选择代理', 'warning'); return }
   accountEditLoading.value = true
   try {
-    const response = await fetch(`/api/admin/douyin-accounts/${accountEditForm.value.id}`, { method: 'PATCH', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ display_name: accountEditForm.value.display_name.trim() }) })
-    if (!response.ok) { notify((await response.json()).detail || '保存失败', 'error'); return }
-    accountEditVisible.value = false; notify('账号名称已更新', 'success'); await load()
+    const response = await fetch(`/api/admin/douyin-accounts/${accountEditForm.value.id}`, { method: 'PATCH', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ display_name: accountEditForm.value.display_name.trim(), proxy_mode: accountEditForm.value.proxy_mode, proxy_id: accountEditForm.value.proxy_mode === 'proxy' ? accountEditForm.value.proxy_id : null }) })
+    if (!response.ok) { notify((await response.json()).detail || '保存失败', 'error'); await refreshAccountProxies(); return }
+    accountEditVisible.value = false; notify('账号信息已更新', 'success'); await load()
   } finally { accountEditLoading.value = false }
 }
 async function setAccountEnabled(row: any, enabled: boolean) {
@@ -1269,7 +1287,7 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
             </el-form>
           </el-card>
           <el-card shadow="never">
-            <div class="table-toolbar"><div class="table-title">账号列表</div><div class="table-actions"><span>共 {{ filteredAccounts.length }} 条记录</span><el-button type="primary" size="small" @click="addAccountVisible = true">新增账号</el-button></div></div>
+            <div class="table-toolbar"><div class="table-title">账号列表</div><div class="table-actions"><span>共 {{ filteredAccounts.length }} 条记录</span><el-button type="primary" size="small" @click="openAddAccount">新增账号</el-button></div></div>
             <el-table v-loading="loading" :data="paginatedAccounts" border stripe style="width: 100%" empty-text="暂无数据">
               <el-table-column type="index" label="序号" width="70" :index="accountTableIndex" /><el-table-column prop="display_name" label="账号名称" min-width="150" /><el-table-column label="归属" width="120"><template #default="{ row }"><el-tag :type="row.ownership_type === 'platform' ? 'primary' : 'success'">{{ row.ownership_type === 'platform' ? '平台账号' : '客户自有' }}</el-tag></template></el-table-column>
               <el-table-column label="状态" width="130"><template #default="{ row }"><el-tag :type="accountStatusMeta(row.status)[1]">{{ accountStatusMeta(row.status)[0] }}</el-tag></template></el-table-column>
@@ -1418,7 +1436,7 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
     </el-dialog>
     <el-dialog v-model="proxyDialogVisible" :title="proxyForm.id ? '编辑代理' : '新增代理'" width="500px" align-center><el-form label-position="top"><el-form-item label="Domain"><el-input v-model="proxyForm.domain" placeholder="proxy.example.com" /></el-form-item><el-form-item label="Port"><el-input-number v-model="proxyForm.port" :min="1" :max="65535" /></el-form-item><el-form-item label="账号"><el-input v-model="proxyForm.username" autocomplete="off" /></el-form-item><el-form-item :label="proxyForm.id ? '密码（留空表示不修改）' : '密码'"><el-input v-model="proxyForm.password" type="password" show-password autocomplete="new-password" /></el-form-item><el-form-item label="到期日期"><el-date-picker v-model="proxyForm.expires_at" type="datetime" value-format="YYYY-MM-DD HH:mm:ss" placeholder="选择到期时间" style="width:100%" /></el-form-item></el-form><template #footer><el-button @click="proxyDialogVisible = false">取消</el-button><el-button type="primary" :loading="proxySaving" @click="saveProxy">保存</el-button></template></el-dialog>
     <el-dialog v-model="proxyAccountsVisible" :title="`代理 ${selectedProxy?.domain || ''}:${selectedProxy?.port || ''} · 抖音号`" width="min(92vw, 760px)" align-center><el-alert v-if="proxyAccounts.length >= (selectedProxy?.max_accounts || 3)" title="已达到默认 3 个账号容量；管理员仍可手动添加" type="warning" :closable="false" style="margin-bottom:12px" /><div class="table-toolbar"><el-select v-model="proxyBindAccountId" filterable clearable placeholder="选择未绑定或需迁移的账号" style="width:300px"><el-option v-for="account in accounts.filter(item => item.proxy_id !== selectedProxy?.id && !['busy', 'paused', 'browser_open'].includes(item.status))" :key="account.id" :label="account.display_name" :value="account.id" /></el-select><el-button type="primary" :disabled="!proxyBindAccountId" @click="bindProxyAccount">手动添加</el-button></div><el-table :data="proxyAccounts" border stripe empty-text="暂无绑定账号"><el-table-column type="index" label="序号" width="70" /><el-table-column prop="display_name" label="账号名称" min-width="180" /><el-table-column label="归属" width="110"><template #default="{ row }">{{ row.ownership_type === 'customer' ? '客户' : '平台' }}</template></el-table-column><el-table-column label="状态" width="130"><template #default="{ row }">{{ accountStatusMeta(row.status)[0] }}</template></el-table-column><el-table-column label="操作" width="100"><template #default="{ row }"><el-button link type="danger" @click="unbindProxyAccount(row)">移除</el-button></template></el-table-column></el-table></el-dialog>
-    <el-dialog v-model="accountEditVisible" title="编辑抖音账号" width="460px" align-center><el-form label-position="left" label-width="90px"><el-form-item label="账号名称"><el-input v-model="accountEditForm.display_name" maxlength="100" /></el-form-item></el-form><template #footer><el-button @click="accountEditVisible = false">取消</el-button><el-button type="primary" :loading="accountEditLoading" @click="saveAccount">保存</el-button></template></el-dialog>
+    <el-dialog v-model="accountEditVisible" title="编辑抖音账号" width="460px" align-center><el-form label-position="left" label-width="90px"><el-form-item label="账号名称"><el-input v-model="accountEditForm.display_name" maxlength="100" /></el-form-item><el-form-item label="连接方式"><el-radio-group v-model="accountEditForm.proxy_mode"><el-radio value="direct">直连</el-radio><el-radio value="proxy">使用代理</el-radio></el-radio-group></el-form-item><el-form-item v-if="accountEditForm.proxy_mode === 'proxy'" label="选择代理"><el-select v-model="accountEditForm.proxy_id" placeholder="请选择可用代理" style="width: 100%"><el-option v-for="proxy in proxies" :key="proxy.id" :label="proxyOptionLabel(proxy)" :value="proxy.id" :disabled="!proxy.available" /></el-select></el-form-item></el-form><template #footer><el-button @click="accountEditVisible = false">取消</el-button><el-button type="primary" :loading="accountEditLoading" @click="saveAccount">保存</el-button></template></el-dialog>
     <el-dialog v-model="accountLogVisible" :title="`${accountLogTarget?.display_name || '抖音账号'} · 账号日志`" width="min(94vw, 1080px)" align-center>
       <el-tabs v-loading="accountLogLoading">
         <el-tab-pane :label="`评论日志（${accountCommentLogs.length}）`">
@@ -1438,7 +1456,7 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
       </div>
       <template #footer><el-button :icon="Refresh" :loading="browserPreviewLoading" @click="refreshBrowserPreview">刷新画面</el-button><el-button @click="browserPreviewVisible = false">关闭</el-button></template>
     </el-dialog>
-    <el-dialog v-model="addAccountVisible" title="新增抖音账号" width="420px" align-center><el-form label-position="top"><el-form-item label="账号名称"><el-input v-model="newAccountName" placeholder="例如：直播账号 01" /></el-form-item></el-form><template #footer><el-button @click="addAccountVisible = false">取消</el-button><el-button type="primary" :loading="addAccountLoading" @click="addAccount">确认新增</el-button></template></el-dialog>
+    <el-dialog v-model="addAccountVisible" title="新增抖音账号" width="420px" align-center><el-form label-position="top"><el-form-item label="账号名称"><el-input v-model="newAccountName" placeholder="例如：直播账号 01" /></el-form-item><el-form-item label="连接方式"><el-radio-group v-model="newAccountProxyMode"><el-radio value="direct">直连</el-radio><el-radio value="proxy">使用代理</el-radio></el-radio-group></el-form-item><el-form-item v-if="newAccountProxyMode === 'proxy'" label="选择代理"><el-select v-model="newAccountProxyId" placeholder="请选择可用代理" style="width: 100%"><el-option v-for="proxy in proxies" :key="proxy.id" :label="proxyOptionLabel(proxy)" :value="proxy.id" :disabled="!proxy.available" /></el-select></el-form-item></el-form><template #footer><el-button @click="addAccountVisible = false">取消</el-button><el-button type="primary" :loading="addAccountLoading" @click="addAccount">确认新增</el-button></template></el-dialog>
     <el-dialog v-model="customerDialogVisible" :title="customerDialogMode === 'create' ? '新增客户' : '编辑客户'" width="520px" align-center>
       <el-form label-position="left" label-width="120px"><el-form-item label="登录名"><el-input v-model="customerForm.login" autocomplete="off" maxlength="190" style="width: 280px" /></el-form-item><el-form-item label="客户名称"><el-input v-model="customerForm.display_name" autocomplete="off" maxlength="100" style="width: 280px" /></el-form-item><el-form-item v-if="customerDialogMode === 'create'" label="初始密码"><el-input v-model="customerForm.password" autocomplete="new-password" type="password" show-password maxlength="128" style="width: 280px" /></el-form-item><el-form-item v-else label="额外账号额度"><el-input-number v-model="customerForm.extra_douyin_account_quota" :min="0" :max="1000" /><div class="cell-secondary">在平台默认额度之外追加</div></el-form-item></el-form>
       <template #footer><el-button @click="customerDialogVisible = false">取消</el-button><el-button type="primary" :loading="customerSubmitting" @click="submitCustomer">保存</el-button></template>
