@@ -45,6 +45,33 @@ class FakePage:
 
 
 class LoginQrTest(unittest.IsolatedAsyncioTestCase):
+    async def test_manual_login_click_uses_current_page(self):
+        responses = []
+
+        class FakePipeline:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def rpush(self, _key, value):
+                responses.append(json.loads(value))
+
+            def expire(self, _key, _seconds):
+                pass
+
+            async def execute(self):
+                pass
+
+        redis = SimpleNamespace(lpop=AsyncMock(side_effect=[b"request-1", None]), pipeline=lambda transaction=True: FakePipeline())
+        platform = SimpleNamespace(click_login_button=AsyncMock(return_value=True))
+        page = object()
+        with patch.object(login_worker, "redis_client", redis):
+            self.assertTrue(await login_worker.answer_login_click_requests(7, page, platform))
+        platform.click_login_button.assert_awaited_once_with(page, log_missing=False, force=True)
+        self.assertEqual(responses, [{"clicked": True, "message": "已点击浏览器登录按钮"}])
+
     async def test_refresh_reloads_same_page_and_replaces_qr(self):
         class FakePipeline:
             def __init__(self):

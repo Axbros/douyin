@@ -259,6 +259,27 @@ async def answer_login_qr_requests(session_id: int, page, session, db) -> bool:
     return found
 
 
+async def answer_login_click_requests(session_id: int, page, platform) -> bool:
+    """Click the login entry in this session's browser on explicit UI request."""
+    request_key = f"douyin:login:click-request:{session_id}"
+    clicked_any = False
+    while request_id := await redis_client.lpop(request_key):
+        request_id = request_id.decode() if isinstance(request_id, bytes) else request_id
+        try:
+            clicked = await platform.click_login_button(page, log_missing=False, force=True)
+            clicked_any = clicked_any or clicked
+            result = {"clicked": clicked, "message": "已点击浏览器登录按钮" if clicked else "当前页面尚未找到登录按钮，请稍后重试"}
+            print(f"[LoginWorker] 手动点击登录按钮，会话 {session_id}: {'成功' if clicked else '未找到按钮'}", flush=True)
+        except Exception as exc:
+            result = {"clicked": False, "message": f"点击登录按钮失败：{type(exc).__name__}: {exc}"[:300]}
+        response_key = f"douyin:login:click-response:{request_id}"
+        async with redis_client.pipeline(transaction=True) as pipe:
+            pipe.rpush(response_key, json.dumps(result, ensure_ascii=False))
+            pipe.expire(response_key, 30)
+            await pipe.execute()
+    return clicked_any
+
+
 async def answer_login_qr_refresh_requests(session_id: int, page, platform, session, db) -> bool:
     """Refresh the same Chromium page and replace its QR when requested."""
     request_key = f"douyin:login:qr-refresh-request:{session_id}"
@@ -924,12 +945,15 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
                     if await redis_client.lpop(f"douyin:login:close:{session_id}"):
                         await close_browser(session_id, browser, context, p)
                         return
+                    if await answer_login_click_requests(session_id, page, platform):
+                        clicked = True
+                        break
                     if await platform.click_login_button(page, log_missing=False):
                         clicked = True
                         break
                     await asyncio.sleep(0.25)
                 if not clicked:
-                    raise RuntimeError("等待登录按钮出现超时")
+                    print(f"[LoginWorker] 未自动找到登录按钮，会话 {session_id} 保持打开供手动点击", flush=True)
                 # 自动尝试十次，之后仍保留会话和浏览器，供管理员手动检测迟到的二维码。
                 qr_result = None
                 for qr_attempt in range(1, 11):
@@ -937,6 +961,7 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
                     if await redis_client.lpop(f"douyin:login:close:{session_id}"):
                         await close_browser(session_id, browser, context, p)
                         return
+                    await answer_login_click_requests(session_id, page, platform)
                     if await answer_login_qr_requests(session_id, page, session, db):
                         qr_result = (session.qr_payload, "image/png", 0)
                         break
@@ -981,6 +1006,7 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
                             await publish(session.id, "cancelled", reason=session.failure_reason)
                             await stop_closed_browser(session_id, browser, context, p)
                             return
+                        await answer_login_click_requests(session_id, page, platform)
                         if await answer_login_qr_requests(session_id, page, session, db):
                             qr_result = (session.qr_payload, "image/png", 0)
                             break
@@ -1016,6 +1042,7 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
                 refresh_request_key = f"douyin:login:qr-refresh-request:{session_id}"
                 while datetime.now().timestamp() < deadline or await redis_client.llen(refresh_request_key):
                     await answer_screenshot_requests("login", session_id, page)
+                    await answer_login_click_requests(session_id, page, platform)
                     if await answer_login_qr_refresh_requests(session_id, page, platform, session, db):
                         deadline = session.expires_at.timestamp()
                         login_candidate_at = None

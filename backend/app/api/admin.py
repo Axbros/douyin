@@ -916,6 +916,30 @@ async def detect_login_qr(session_id: int, user: Annotated[User, Depends(admin_u
     return {"found": True, "qr_payload": session.qr_payload}
 
 
+@router.post("/douyin-login-sessions/{session_id}/click-login")
+async def click_login_in_browser(session_id: int, user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    session = await db.scalar(select(AccountLoginSession).where(
+        AccountLoginSession.id == session_id, AccountLoginSession.deleted_at.is_(None),
+    ))
+    if not session:
+        raise HTTPException(404, "登录会话不存在")
+    if session.status != "waiting" or session.expires_at <= datetime.now():
+        raise HTTPException(409, "登录会话已结束，请重新发起扫码登录")
+    if not await redis_client.exists(resource_key("login", session_id)):
+        raise HTTPException(409, "登录浏览器尚未启动或已关闭，请稍后重试")
+    request_id = token_urlsafe(18)
+    request_key = f"douyin:login:click-request:{session_id}"
+    response_key = f"douyin:login:click-response:{request_id}"
+    async with redis_client.pipeline(transaction=True) as pipe:
+        pipe.rpush(request_key, request_id)
+        pipe.expire(request_key, 35)
+        await pipe.execute()
+    item = await redis_client.blpop(response_key, timeout=30)
+    if not item:
+        raise HTTPException(504, "等待浏览器点击登录超时，请确认页面已加载")
+    return json.loads(item[1])
+
+
 @router.post("/douyin-login-sessions/{session_id}/refresh-qr")
 async def refresh_login_qr(session_id: int, user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
     session = await db.scalar(select(AccountLoginSession).where(
