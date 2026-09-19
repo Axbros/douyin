@@ -21,7 +21,7 @@ from sqlalchemy import select
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.core.crypto import decrypt_transient_secret, encrypt_storage_state
 from app.core.browser_preview import answer_screenshot_requests
-from app.core.browser_resources import pool_command_key, remove_resource, resource_heartbeat, touch_resource
+from app.core.browser_resources import new_browser_id, pool_command_key, remove_resource, resource_heartbeat, touch_resource
 from app.core.database import SessionLocal, redis_client
 from app.core.login_browser_pool import LoginBrowserPool, PreparedBrowser
 from app.core.platform_settings import get_platform_settings
@@ -32,8 +32,8 @@ from src.platforms import create_platform
 
 WORKER_HEARTBEAT_KEY = "douyin:login-worker:heartbeat"
 WORKER_HEARTBEAT_TTL_SECONDS = 300
-LOGIN_HOME_URL = "https://www.douyin.com/"
-LOGIN_FALLBACK_URL = "https://live.douyin.com/"
+LOGIN_HOME_URL = "https://live.douyin.com/"
+LOGIN_FALLBACK_URL = "https://www.douyin.com/"
 
 
 async def login_home_usable(page) -> bool:
@@ -100,7 +100,7 @@ async def recycle_claimed_browser(item: PreparedBrowser, browser_pool: LoginBrow
     fresh_context = await item.browser.new_context()
     try:
         fresh_page = await fresh_context.new_page()
-        await fresh_page.goto(LOGIN_FALLBACK_URL, wait_until="domcontentloaded", timeout=20000)
+        await fresh_page.goto(LOGIN_HOME_URL, wait_until="domcontentloaded", timeout=20000)
         item.context = fresh_context
         item.page = fresh_page
         if item.proxy_config is not None and browser_pool.target_proxy_config != item.proxy_config:
@@ -922,7 +922,7 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
                     if await recycle_claimed_browser(prepared, browser_pool):
                         # The pool now owns the browser and its authenticated SOCKS5 bridge.
                         proxy_bridge = None
-                        print(f"[LoginWorker] 关闭扫码弹窗后已复用 Chromium，会话 {session_id}，页面 {LOGIN_FALLBACK_URL}", flush=True)
+                        print(f"[LoginWorker] 关闭扫码弹窗后已复用 Chromium，会话 {session_id}，浏览器 {prepared.resource_id}，页面 {LOGIN_HOME_URL}", flush=True)
                         return
                 except Exception as exc:
                     print(f"[LoginWorker] 恢复备用浏览器失败，会话 {session_id}: {type(exc).__name__}: {exc}", flush=True)
@@ -947,7 +947,7 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
                     prepared.page, prepared.proxy_bridge,
                 )
                 browser_claimed = True
-                print(f"[LoginWorker] 复用已加载抖音首页的备用浏览器，会话 {session_id}", flush=True)
+                print(f"[LoginWorker] 复用备用浏览器，会话 {session_id}，浏览器 {prepared.resource_id}", flush=True)
             else:
                 # 新代理或备用浏览器尚未准备好时，按账号绑定的代理启动。
                 # Linux 无桌面服务器由 Xvfb 提供虚拟屏幕。
@@ -967,7 +967,12 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
                 print(f"[LoginWorker] Chromium 已启动，会话 {session_id}", flush=True)
                 context = await browser.new_context()
                 page = await context.new_page()
-            resource_task = asyncio.create_task(resource_heartbeat("login", session_id, page, account_id=account.id))
+            session_browser_id = prepared.resource_id if browser_claimed and prepared is not None else new_browser_id()
+            print(f"[LoginWorker] 会话 {session_id} 浏览器 ID: {session_browser_id}，来源: {'备用复用' if browser_claimed else '新开'}", flush=True)
+            resource_task = asyncio.create_task(resource_heartbeat(
+                "login", session_id, page, account_id=account.id,
+                browser_id=session_browser_id, origin="warm" if browser_claimed else "new",
+            ))
             try:
                 if not browser_claimed:
                     try:
@@ -1514,7 +1519,8 @@ async def main():
                     proxy = prepared.proxy_config
                     proxy_label = f"{proxy['host']}:{proxy['port']}" if proxy else "直连"
                     await touch_resource("warm", prepared.resource_id, opened_at=prepared.opened_at,
-                                         url=prepared.page.url, proxy_label=proxy_label)
+                                         url=prepared.page.url, proxy_label=proxy_label,
+                                         browser_id=prepared.resource_id, origin="warm")
                     await answer_screenshot_requests("warm", prepared.resource_id, prepared.page)
                 now = asyncio.get_running_loop().time()
                 if now - last_warm_retry >= 15:

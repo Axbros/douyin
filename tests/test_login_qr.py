@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 from backend.workers import login_worker
 from backend.workers.login_worker import read_login_qr
+from app.api import admin
 
 
 class FakeImage:
@@ -45,6 +46,20 @@ class FakePage:
 
 
 class LoginQrTest(unittest.IsolatedAsyncioTestCase):
+    async def test_login_status_exposes_same_browser_id_as_resource(self):
+        session = SimpleNamespace(id=7, account_id=3, status="waiting",
+                                  expires_at=datetime.now() + timedelta(minutes=5),
+                                  qr_payload=None, failure_reason=None)
+        db = SimpleNamespace(scalar=AsyncMock(return_value=session))
+        redis = SimpleNamespace(
+            get=AsyncMock(return_value=json.dumps({"browser_id": "browser-abc", "origin": "warm"})),
+            mget=AsyncMock(return_value=[None, None]),
+        )
+        with patch.object(admin, "redis_client", redis):
+            result = await admin.login_session_status(7, SimpleNamespace(id=1), db)
+        self.assertEqual(result["browser_id"], "browser-abc")
+        self.assertEqual(result["browser_origin"], "warm")
+
     async def test_manual_login_click_uses_current_page(self):
         responses = []
 

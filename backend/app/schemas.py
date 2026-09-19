@@ -318,6 +318,8 @@ class BrowserResourceResponse(BaseModel):
     heartbeat_at: datetime
     url: str = ""
     proxy_label: str = ""
+    browser_id: str = ""
+    origin: str = ""
     hostname: str = ""
     process_id: int | None = None
 
@@ -370,6 +372,8 @@ class LoginSessionResponse(BaseModel):
     failure_reason: str | None = None
     verification_options: list[LoginVerificationOption] = Field(default_factory=list)
     selected_verification_method: LoginVerificationOption | None = None
+    browser_id: str | None = None
+    browser_origin: str | None = None
 
     model_config = {"from_attributes": True}
 

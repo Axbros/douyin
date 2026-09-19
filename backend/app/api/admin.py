@@ -928,6 +928,11 @@ async def login_session_status(session_id: int, user: Annotated[User, Depends(ad
     if not session:
         raise HTTPException(404, "登录会话不存在")
     result = LoginSessionResponse.model_validate(session).model_dump()
+    browser_data = await redis_client.get(resource_key("login", session.id))
+    if browser_data:
+        browser_info = json.loads(browser_data)
+        result["browser_id"] = browser_info.get("browser_id")
+        result["browser_origin"] = browser_info.get("origin")
     options_raw, selected_raw = await redis_client.mget(
         f"douyin:login:verification-options:{session.id}",
         f"douyin:login:selected-verification:{session.id}",

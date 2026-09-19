@@ -2,7 +2,7 @@ import asyncio
 import unittest
 
 from backend.app.core.login_browser_pool import LoginBrowserPool, PreparedBrowser
-from backend.workers.login_worker import LOGIN_FALLBACK_URL, recycle_claimed_browser
+from backend.workers.login_worker import LOGIN_HOME_URL, recycle_claimed_browser
 
 
 class FakeBrowser:
@@ -55,7 +55,7 @@ class LoginBrowserPoolTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await recycle_claimed_browser(claimed, pool))
         self.assertTrue(old_context.closed)
         self.assertIsNot(claimed.context, old_context)
-        self.assertEqual(claimed.page.url, LOGIN_FALLBACK_URL)
+        self.assertEqual(claimed.page.url, LOGIN_HOME_URL)
         self.assertEqual(len(pool.ready), 2)
         self.assertEqual((await pool.claim(None)).resource_id, prepared[1].resource_id)
         self.assertEqual((await pool.claim(None)).resource_id, claimed.resource_id)
