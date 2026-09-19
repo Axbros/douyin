@@ -910,6 +910,9 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
             else:
                 # 新代理或备用浏览器尚未准备好时，按账号绑定的代理启动。
                 # Linux 无桌面服务器由 Xvfb 提供虚拟屏幕。
+                connection = f"代理 {proxy_config['host']}:{proxy_config['port']}" if proxy_config else "直连"
+                print(f"[LoginWorker] 无可领取的{connection}备用浏览器，会话 {session_id}，启动新 Chromium", flush=True)
+                await browser_pool.retarget(proxy_config)
                 if proxy_config:
                     proxy_bridge = Socks5Bridge(**proxy_config)
                     browser_proxy = await proxy_bridge.start()
@@ -1428,7 +1431,22 @@ async def main():
     targeted_pool_commands = pool_command_key(socket.gethostname(), os.getpid())
     running_sessions: dict[int, asyncio.Task] = {}
     registered_warm_ids: set[str] = set()
+    navigation_tasks: set[asyncio.Task] = set()
     last_warm_retry = asyncio.get_running_loop().time()
+
+    async def navigate_warm_browser(command: dict) -> None:
+        response_key = command["response_key"]
+        try:
+            loaded_url = await browser_pool.navigate_slot(str(command["resource_id"]), command["url"])
+            result = {"ok": True, "url": loaded_url}
+            print(f"[LoginWorker] 备用浏览器已跳转: {loaded_url}", flush=True)
+        except Exception as exc:
+            result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+            print(f"[LoginWorker] 备用浏览器跳转失败: {result['error']}", flush=True)
+        async with redis_client.pipeline(transaction=True) as pipe:
+            pipe.rpush(response_key, json.dumps(result, ensure_ascii=False))
+            pipe.expire(response_key, 30)
+            await pipe.execute()
 
     def session_finished(session_id: int, task: asyncio.Task):
         running_sessions.pop(session_id, None)
@@ -1449,7 +1467,10 @@ async def main():
                     await remove_resource("warm", resource_id)
                 registered_warm_ids = current_warm_ids
                 for prepared in ready:
-                    await touch_resource("warm", prepared.resource_id, opened_at=prepared.opened_at, url=prepared.page.url)
+                    proxy = prepared.proxy_config
+                    proxy_label = f"{proxy['host']}:{proxy['port']}" if proxy else "直连"
+                    await touch_resource("warm", prepared.resource_id, opened_at=prepared.opened_at,
+                                         url=prepared.page.url, proxy_label=proxy_label)
                     await answer_screenshot_requests("warm", prepared.resource_id, prepared.page)
                 now = asyncio.get_running_loop().time()
                 if now - last_warm_retry >= 15:
@@ -1470,6 +1491,10 @@ async def main():
                         elif command.get("action") == "open":
                             await browser_pool.open_slot(await initial_warm_proxy_config())
                             print("[LoginWorker] 已请求打开备用浏览器", flush=True)
+                        elif command.get("action") == "navigate":
+                            task = asyncio.create_task(navigate_warm_browser(command))
+                            navigation_tasks.add(task)
+                            task.add_done_callback(navigation_tasks.discard)
                         continue
                     session_id = int(item[1])
                     if session_id in running_sessions:
@@ -1486,7 +1511,10 @@ async def main():
         await asyncio.gather(heartbeat_task, return_exceptions=True)
         for task in running_sessions.values():
             task.cancel()
+        for task in navigation_tasks:
+            task.cancel()
         await asyncio.gather(*running_sessions.values(), return_exceptions=True)
+        await asyncio.gather(*navigation_tasks, return_exceptions=True)
         warm_ids = [item.resource_id for item in browser_pool.ready]
         await browser_pool.close()
         for resource_id in warm_ids:

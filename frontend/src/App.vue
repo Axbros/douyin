@@ -44,6 +44,10 @@ const browserResources = ref<any[]>([])
 const browserResourcesLoading = ref(false)
 const resourceAccountId = ref<number | null>(null)
 const resourceActionKey = ref('')
+const resourceAddressVisible = ref(false)
+const resourceAddressSaving = ref(false)
+const resourceAddressId = ref('')
+const resourceAddressUrl = ref('')
 const resourceKindFilter = ref('')
 const filteredBrowserResources = computed(() => browserResources.value.filter(item => !resourceKindFilter.value || item.kind === resourceKindFilter.value))
 let browserResourcesTimer: number | null = null
@@ -613,6 +617,33 @@ async function loadBrowserResources(showError = true) {
 }
 function showResourcePreview(row: any) {
   showBrowserPreview(`/api/admin/browser-resources/${row.kind}/${row.resource_id}/screenshot`, `${row.account_name || resourceKindText(row.kind)} · 浏览器画面`)
+}
+function openResourceAddress(row: any) {
+  resourceAddressId.value = row.resource_id
+  resourceAddressUrl.value = row.url || 'https://www.douyin.com/'
+  resourceAddressVisible.value = true
+}
+async function saveResourceAddress() {
+  let url: URL
+  try {
+    url = new URL(resourceAddressUrl.value.trim())
+    if (!['http:', 'https:'].includes(url.protocol)) throw new Error('invalid protocol')
+  } catch { notify('请输入完整的 http 或 https 地址', 'warning'); return }
+  resourceAddressSaving.value = true
+  try {
+    const response = await fetch(`/api/admin/browser-resources/warm/${resourceAddressId.value}/navigate`, {
+      method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: url.toString() }),
+    })
+    if (!response.ok) { notify((await response.json()).detail || '浏览器跳转失败', 'error'); return }
+    const result = await response.json()
+    const resource = browserResources.value.find(item => item.kind === 'warm' && item.resource_id === resourceAddressId.value)
+    if (resource) resource.url = result.url
+    resourceAddressVisible.value = false
+    notify('备用浏览器已加载新地址', 'success')
+    window.setTimeout(() => loadBrowserResources(false), 1200)
+  } catch { notify('浏览器跳转请求失败', 'error') }
+  finally { resourceAddressSaving.value = false }
 }
 async function openSelectedAccountBrowser() {
   if (!resourceAccountId.value) return
@@ -1338,11 +1369,12 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
               <el-table-column type="index" label="序号" width="70" />
               <el-table-column label="类型" width="150"><template #default="{ row }"><el-tag :type="row.kind === 'task' ? 'warning' : row.kind === 'warm' ? 'info' : 'primary'">{{ resourceKindText(row.kind) }}</el-tag></template></el-table-column>
               <el-table-column label="抖音账号" min-width="150"><template #default="{ row }">{{ row.account_name || (row.kind === 'warm' ? '未分配' : '—') }}</template></el-table-column>
+              <el-table-column label="连接方式" min-width="145"><template #default="{ row }">{{ row.kind === 'warm' ? (row.proxy_label || '读取中') : '—' }}</template></el-table-column>
               <el-table-column label="当前任务" width="110"><template #default="{ row }">{{ row.task_id ? '执行中' : '—' }}</template></el-table-column>
               <el-table-column label="当前页面" min-width="220" show-overflow-tooltip><template #default="{ row }">{{ row.url || '页面加载中' }}</template></el-table-column>
               <el-table-column label="打开时间" width="180"><template #default="{ row }">{{ formatDate(row.opened_at) }}</template></el-table-column>
               <el-table-column label="最近心跳" width="180"><template #default="{ row }">{{ formatDate(row.heartbeat_at) }}</template></el-table-column>
-              <el-table-column label="操作" width="190" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="showResourcePreview(row)">查看画面</el-button><el-button link type="danger" :loading="resourceActionKey === `${row.kind}:${row.resource_id}`" @click="closeBrowserResource(row)">关闭</el-button></template></el-table-column>
+              <el-table-column label="操作" width="280" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="showResourcePreview(row)">查看画面</el-button><el-button v-if="row.kind === 'warm'" link type="primary" @click="openResourceAddress(row)">修改地址</el-button><el-button link type="danger" :loading="resourceActionKey === `${row.kind}:${row.resource_id}`" @click="closeBrowserResource(row)">关闭</el-button></template></el-table-column>
             </el-table>
           </el-card>
         </template>
@@ -1449,6 +1481,7 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
     </el-dialog>
     <el-dialog v-model="wordDialogVisible" :title="wordDialogMode === 'create' ? '新增敏感词' : '编辑敏感词'" width="480px" align-center><el-form label-position="left" label-width="90px"><el-form-item label="敏感词"><el-input v-model="wordForm.word" maxlength="255" show-word-limit /></el-form-item><el-form-item label="匹配方式"><el-select v-model="wordForm.match_type" style="width:100%"><el-option label="包含匹配" value="contains" /><el-option label="完全匹配" value="exact" /><el-option label="正则表达式" value="regex" /></el-select></el-form-item></el-form><template #footer><el-button @click="wordDialogVisible = false">取消</el-button><el-button type="primary" :loading="wordSubmitting" @click="saveSensitiveWord">保存</el-button></template></el-dialog>
     <el-dialog v-model="qrDialogVisible" width="440px" align-center :close-on-click-modal="false" :before-close="closeQr"><template #header><div class="dialog-title"><Key /><span>扫码登录抖音账号</span></div></template><div v-if="loginApiScope === 'admin'" class="browser-preview-entry"><el-button :loading="clickingLogin" :disabled="!loginSessionId || loginStatus !== 'waiting'" @click="clickLoginInBrowser">点击登录</el-button><el-button v-if="qr || qrRefreshing" type="primary" :loading="qrRefreshing" :disabled="!loginSessionId || loginStatus !== 'waiting'" @click="refreshLoginQr">重新获取二维码</el-button><el-button v-else type="primary" :loading="detectingLoginQr" :disabled="!loginSessionId || loginStatus !== 'waiting'" @click="detectLoginQr">获取登录二维码</el-button><el-button :icon="Monitor" :loading="browserPreviewLoading" :disabled="!loginSessionId" @click="showLoginBrowserPreview">查看浏览器画面</el-button></div><el-result v-if="loginStatus === 'success'" icon="success" title="登录成功" sub-title="账号登录状态已安全保存"><template #extra><el-button type="primary" @click="closeQr()">完成并关闭浏览器</el-button></template></el-result><div v-else-if="loginStatus === 'method_required'" class="method-stage"><div class="verify-icon"><Operation /></div><h3>选择二次验证方式</h3><p>请选择该账号当前可以完成的验证方式</p><div class="method-list"><div v-for="option in verificationOptions" :key="option.id" class="method-option" :class="{ selected: verificationMethodId === option.id }" @click="verificationMethodId = option.id"><el-radio :model-value="verificationMethodId" :value="option.id"><span class="method-label">{{ option.label }}</span></el-radio><small v-if="option.description">{{ option.description }}</small></div></div><el-button type="primary" size="large" :loading="verificationMethodSubmitting" :disabled="!verificationMethodId" @click="submitVerificationMethod">使用此验证方式</el-button><p v-if="verificationHint" class="verify-error">{{ verificationHint }}</p></div><div v-else-if="loginStatus === 'method_processing'" class="verify-stage"><div class="verify-icon"><Lock /></div><h3>{{ selectedVerificationMethod?.label || '正在打开验证方式' }}</h3><p>{{ selectedVerificationMethod?.description || '请按照浏览器或手机上的提示完成验证' }}</p><el-button loading size="large">等待验证结果</el-button><p v-if="verificationHint" class="verify-error">{{ verificationHint }}</p></div><div v-else-if="['password_required', 'password_filling', 'password_ready', 'password_clicking', 'password_verifying'].includes(loginStatus)" class="verify-stage"><div class="verify-icon"><Lock /></div><h3>登录密码验证</h3><p>{{ loginStatus === 'password_ready' ? '密码已填入浏览器，请点击验证密码' : loginStatus === 'password_verifying' ? '抖音正在验证登录密码' : '请输入该抖音账号的登录密码' }}</p><el-input v-model="loginPassword" type="password" show-password maxlength="50" autocomplete="new-password" placeholder="请输入登录密码" size="large" :disabled="['password_filling', 'password_clicking', 'password_verifying'].includes(loginStatus)" @keyup.enter="submitLoginPassword" /><div class="password-actions"><el-button size="large" :loading="loginPasswordSubmitting || loginStatus === 'password_filling'" :disabled="!loginPassword || ['password_filling', 'password_clicking', 'password_verifying'].includes(loginStatus)" @click="submitLoginPassword">提交密码</el-button><el-button type="primary" size="large" :loading="loginPasswordVerifySubmitting || ['password_clicking', 'password_verifying'].includes(loginStatus)" :disabled="loginStatus !== 'password_ready'" @click="verifyLoginPassword">验证密码</el-button></div><p v-if="verificationHint" class="verify-error">{{ verificationHint }}</p></div><div v-else-if="['verify_required', 'verifying'].includes(loginStatus)" class="verify-stage"><div class="verify-icon"><Lock /></div><h3>短信二次认证</h3><p>验证码已经发送到该抖音账号绑定的手机号</p><el-input :model-value="verificationCode" maxlength="6" inputmode="numeric" autocomplete="one-time-code" placeholder="请输入6位验证码" size="large" :disabled="loginStatus === 'verifying'" @input="normalizeVerificationCode" @keyup.enter="submitVerificationCode" /><el-button type="primary" size="large" :loading="verificationSubmitting || loginStatus === 'verifying'" :disabled="verificationCode.length !== 6 || loginStatus === 'verifying'" @click="submitVerificationCode">{{ loginStatus === 'verifying' ? '正在验证…' : '提交验证码' }}</el-button><p v-if="verificationHint" class="verify-error">{{ verificationHint }}</p></div><template v-else><div v-loading="qrLoading" class="qr-stage"><img v-if="qr" :src="qr" alt="抖音登录二维码"><div v-else class="qr-placeholder"><Connection /><span>正在启动浏览器并获取二维码…</span></div></div><p class="qr-tip">{{ qr ? '请使用抖音 App 扫码，完成后等待登录确认' : loginStatus === 'waiting' ? '正在等待二维码，可随时点击上方按钮手动检测' : '登录会话已结束，请关闭弹窗后重新扫码' }}</p></template></el-dialog>
+    <el-dialog v-model="resourceAddressVisible" title="修改备用浏览器地址" width="500px" align-center><el-form label-position="top" @submit.prevent="saveResourceAddress"><el-form-item label="页面地址"><el-input v-model="resourceAddressUrl" placeholder="https://www.douyin.com/" clearable /></el-form-item></el-form><template #footer><el-button @click="resourceAddressVisible = false">取消</el-button><el-button type="primary" :loading="resourceAddressSaving" @click="saveResourceAddress">保存并加载</el-button></template></el-dialog>
     <el-dialog v-model="browserPreviewVisible" :title="browserPreviewTitle" width="min(94vw, 1100px)" align-center append-to-body @closed="clearBrowserPreview">
       <div v-loading="browserPreviewLoading" class="browser-preview-stage">
         <img v-if="browserPreviewUrl" :src="browserPreviewUrl" alt="当前浏览器截图">

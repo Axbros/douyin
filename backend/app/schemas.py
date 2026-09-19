@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
 
 class LoginRequest(BaseModel):
@@ -317,8 +317,13 @@ class BrowserResourceResponse(BaseModel):
     opened_at: datetime
     heartbeat_at: datetime
     url: str = ""
+    proxy_label: str = ""
     hostname: str = ""
     process_id: int | None = None
+
+
+class BrowserNavigateRequest(BaseModel):
+    url: HttpUrl
 
 
 class ProxyResponse(BaseModel):

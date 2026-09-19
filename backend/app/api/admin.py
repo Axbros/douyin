@@ -39,6 +39,7 @@ from app.schemas import (
     AdminCustomerStatusUpdate,
     AdminCustomerUpdate,
     AdminScriptResponse,
+    BrowserNavigateRequest,
     BrowserResourceResponse,
     CommentLogResponse,
     DouyinAccountUpdate,
@@ -1105,6 +1106,27 @@ async def open_warm_browser(user: Annotated[User, Depends(admin_user)]):
         raise HTTPException(503, "扫码登录 Worker 未运行")
     await redis_client.rpush("douyin:login:pool:commands", json.dumps({"action": "open"}))
     return {"message": "备用浏览器打开指令已发送"}
+
+
+@router.post("/browser-resources/warm/{resource_id}/navigate")
+async def navigate_warm_browser(resource_id: str, payload: BrowserNavigateRequest,
+                                user: Annotated[User, Depends(admin_user)]):
+    resource_data = await redis_client.get(resource_key("warm", resource_id))
+    if not resource_data:
+        raise HTTPException(404, "备用浏览器已被领取或关闭")
+    owner = json.loads(resource_data)
+    request_id = token_urlsafe(18)
+    response_key = f"douyin:login:pool:navigate-response:{request_id}"
+    await redis_client.rpush(pool_command_key(owner["hostname"], owner["process_id"]),
+                             json.dumps({"action": "navigate", "resource_id": resource_id,
+                                         "url": str(payload.url), "response_key": response_key}))
+    item = await redis_client.blpop(response_key, timeout=20)
+    if not item:
+        raise HTTPException(504, "浏览器跳转超时，请刷新资源列表查看当前页面")
+    result = json.loads(item[1])
+    if not result.get("ok"):
+        raise HTTPException(409, result.get("error") or "浏览器跳转失败")
+    return {"url": result["url"]}
 
 
 @router.post("/browser-resources/{kind}/{resource_id}/close", status_code=202)

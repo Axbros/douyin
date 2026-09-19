@@ -21,7 +21,7 @@ def pool_command_key(hostname: str, process_id: int) -> str:
 
 async def touch_resource(kind: str, resource_id: str | int, *, account_id: int | None = None,
                          task_id: int | None = None, opened_at: str | None = None,
-                         url: str = "") -> None:
+                         url: str = "", proxy_label: str = "") -> None:
     key = resource_key(kind, resource_id)
     previous = await redis_client.get(key)
     if previous:
@@ -31,6 +31,7 @@ async def touch_resource(kind: str, resource_id: str | int, *, account_id: int |
         "kind": kind, "resource_id": str(resource_id), "account_id": account_id,
         "task_id": task_id, "opened_at": opened_at or datetime.now().isoformat(),
         "heartbeat_at": datetime.now().isoformat(), "url": url,
+        "proxy_label": proxy_label,
         "hostname": socket.gethostname(), "process_id": os.getpid(),
     }
     await redis_client.set(key, json.dumps(data, ensure_ascii=False), ex=RESOURCE_TTL_SECONDS)
