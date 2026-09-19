@@ -26,6 +26,7 @@ class LoginBrowserPool:
         self.dispose = dispose
         self.size = size
         self.desired_size = size
+        self.target_proxy_config: dict | None = None
         self.ready: deque[PreparedBrowser] = deque()
         self.pending: dict[asyncio.Task, dict | None] = {}
         self.disposing: set[asyncio.Task] = set()
@@ -33,6 +34,7 @@ class LoginBrowserPool:
         self.closed = False
 
     async def initialize(self, proxy_config: dict | None) -> None:
+        self.target_proxy_config = proxy_config
         # gather preserves launch order even when page loads finish out of order.
         results = await asyncio.gather(
             *(self.prepare(proxy_config) for _ in range(self.size)), return_exceptions=True
@@ -73,6 +75,7 @@ class LoginBrowserPool:
     async def open_slot(self, proxy_config: dict | None) -> None:
         async with self.lock:
             self.desired_size = min(self.size, self.desired_size + 1)
+            self.target_proxy_config = proxy_config
         await self.replenish(proxy_config)
 
     async def prune_closed(self) -> list[str]:
@@ -95,6 +98,7 @@ class LoginBrowserPool:
     async def retarget(self, proxy_config: dict | None) -> None:
         """After a login, make the two idle slots useful for the next account."""
         async with self.lock:
+            self.target_proxy_config = proxy_config
             stale = [item for item in self.ready if item.proxy_config != proxy_config]
             self.ready = deque(item for item in self.ready if item.proxy_config == proxy_config)
             stale_pending = [task for task, config in self.pending.items() if config != proxy_config]

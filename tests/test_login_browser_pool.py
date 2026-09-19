@@ -15,6 +15,27 @@ class FakePage:
 
 
 class LoginBrowserPoolTest(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_initial_preheat_can_be_retried(self):
+        attempts = 0
+
+        async def prepare(config):
+            nonlocal attempts
+            attempts += 1
+            if attempts <= 2:
+                raise RuntimeError("temporary navigation failure")
+            return PreparedBrowser(attempts, FakeBrowser(), None, FakePage(), config)
+
+        async def dispose(item):
+            pass
+
+        pool = LoginBrowserPool(prepare, dispose)
+        await pool.initialize(None)
+        self.assertEqual(len(pool.ready), 0)
+        await pool.replenish(pool.target_proxy_config)
+        await asyncio.gather(*list(pool.pending))
+        self.assertEqual(len(pool.ready), 2)
+        await pool.close()
+
     async def test_manual_close_and_open_change_idle_capacity(self):
         created = []
         disposed = []

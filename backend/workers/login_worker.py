@@ -84,14 +84,9 @@ async def prepare_login_browser(proxy_config: dict | None) -> PreparedBrowser:
             await item.page.goto(LOGIN_HOME_URL, wait_until="domcontentloaded", timeout=20000)
             await wait_for_optional_load(item.page)
         except PlaywrightError as exc:
-            print(f"[LoginWorker] 抖音首页预热导航失败，尝试直播首页: {type(exc).__name__}", flush=True)
-        if not await login_home_usable(item.page):
-            print("[LoginWorker] 抖音首页没有可用登录入口，改用直播首页预热", flush=True)
-            await item.page.goto(LOGIN_FALLBACK_URL, wait_until="domcontentloaded", timeout=60000)
-            await wait_for_optional_load(item.page)
-            if not await login_home_usable(item.page):
-                raise RuntimeError("抖音首页及直播首页均未出现登录入口")
-        print("[LoginWorker] 备用 Chromium 已打开抖音首页，等待扫码登录任务", flush=True)
+            # 页面可能停在验证中间页；窗口仍可供管理员查看和后续登录会话使用。
+            print(f"[LoginWorker] 备用浏览器导航抖音首页失败，保留窗口: {type(exc).__name__}: {exc}", flush=True)
+        print(f"[LoginWorker] 备用 Chromium 已打开，当前页面: {item.page.url}", flush=True)
         return item
     except BaseException:
         await dispose_prepared_browser(item)
@@ -869,6 +864,10 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
                         print(f"[LoginWorker] 抖音首页没有可用登录入口，改用直播首页，会话 {session_id}", flush=True)
                         if await navigate_or_close(page, LOGIN_FALLBACK_URL, session_id, browser, context, p):
                             return
+                elif not await login_home_usable(page):
+                    print(f"[LoginWorker] 备用浏览器页面没有登录入口，尝试直播首页，会话 {session_id}", flush=True)
+                    if await navigate_or_close(page, LOGIN_FALLBACK_URL, session_id, browser, context, p):
+                        return
                 print(f"[LoginWorker] 抖音页面加载完毕，会话 {session_id}，开始查找登录按钮", flush=True)
                 clicked = False
                 for _ in range(60):
@@ -1346,6 +1345,7 @@ async def main():
     targeted_pool_commands = pool_command_key(socket.gethostname(), os.getpid())
     running_sessions: dict[int, asyncio.Task] = {}
     registered_warm_ids: set[str] = set()
+    last_warm_retry = asyncio.get_running_loop().time()
 
     def session_finished(session_id: int, task: asyncio.Task):
         running_sessions.pop(session_id, None)
@@ -1368,6 +1368,10 @@ async def main():
                 for prepared in ready:
                     await touch_resource("warm", prepared.resource_id, opened_at=prepared.opened_at, url=prepared.page.url)
                     await answer_screenshot_requests("warm", prepared.resource_id, prepared.page)
+                now = asyncio.get_running_loop().time()
+                if now - last_warm_retry >= 15:
+                    await browser_pool.replenish(browser_pool.target_proxy_config)
+                    last_warm_retry = now
                 item = await redis_client.blpop(
                     [targeted_pool_commands, "douyin:login:pool:commands", "douyin:login:sessions"], timeout=1
                 )
