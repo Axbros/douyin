@@ -212,6 +212,57 @@ async def publish(session_id: int, event: str, **data):
     await redis_client.publish(f"douyin:login:{session_id}", json.dumps({"event": event, **data}, ensure_ascii=False))
 
 
+async def read_login_qr(page) -> tuple[str, str, float] | None:
+    """Read only a visible, valid Douyin login QR image from the current page."""
+    selectors = [
+        "xpath=/html/body/div[36]/div/div/div/div/div/article/div/div[2]/div/div[1]/div/div/div[2]/div/div/div/div/div[2]/img",
+        '[role="dialog"] img[aria-label="二维码"]',
+        'img[aria-label="二维码"]',
+    ]
+    chosen = None
+    for selector in selectors:
+        candidates = page.locator(selector)
+        for index in range(await candidates.count()):
+            candidate = candidates.nth(index)
+            try:
+                if not await candidate.is_visible():
+                    continue
+                src = await candidate.get_attribute("src")
+                if not src or not src.startswith("data:image/") or "," not in src:
+                    continue
+                header, encoded = src.split(",", 1)
+                mime = header.split(";", 1)[0][5:]
+                decoded = base64.b64decode(encoded, validate=True)
+                area = await candidate.evaluate("el => el.getBoundingClientRect().width * el.getBoundingClientRect().height")
+            except Exception:
+                continue
+            if mime == "image/png" and decoded.startswith(b"\x89PNG") and len(decoded) > 500 and (chosen is None or area > chosen[2]):
+                chosen = (encoded, mime, area)
+    return chosen
+
+
+async def answer_login_qr_requests(session_id: int, page, session, db) -> bool:
+    """Handle manual checks; return whether a QR is now saved on the session."""
+    request_key = f"douyin:login:qr-request:{session_id}"
+    found = False
+    while request_id := await redis_client.lpop(request_key):
+        request_id = request_id.decode() if isinstance(request_id, bytes) else request_id
+        result = await read_login_qr(page)
+        if result:
+            encoded, mime, area = result
+            session.qr_payload = encoded
+            await db.commit()
+            await publish(session_id, "qr", image=encoded, expires_at=session.expires_at.isoformat())
+            print(f"[LoginWorker] 手动检测获取到登录二维码，会话 {session_id}: mime={mime}, area={area:.0f}", flush=True)
+            found = True
+        else:
+            print(f"[LoginWorker] 手动检测未找到有效登录二维码，会话 {session_id}", flush=True)
+        response_key = f"douyin:login:qr-response:{request_id}"
+        await redis_client.rpush(response_key, json.dumps({"found": bool(result)}))
+        await redis_client.expire(response_key, 30)
+    return found
+
+
 async def second_verification_container(page, context=None):
     """定时扫描全部标签页和 iframe，不依赖动态 class。"""
     pages = context.pages if context is not None else [page]
@@ -830,46 +881,18 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
                     await asyncio.sleep(0.25)
                 if not clicked:
                     raise RuntimeError("等待登录按钮出现超时")
-                # 只接受语义明确的二维码 img，不能用任意 data:image 兜底，
-                # 否则会误取头像、Logo 等页面图片。
-                qr_selectors = [
-                    # 当前抖音页面实测位置，优先使用管理员提供的完整 XPath。
-                    "xpath=/html/body/div[36]/div/div/div/div/div/article/div/div[2]/div/div[1]/div/div/div[2]/div/div/div/div/div[2]/img",
-                    # 页面结构变化后的语义兜底：优先弹窗内二维码，再查找所有二维码图片。
-                    '[role="dialog"] img[aria-label="二维码"]',
-                    'img[aria-label="二维码"]',
-                ]
-                image = None
-                mime = ""
-                encoded = ""
-                chosen_area = 0
+                # 自动尝试十次，之后仍保留会话和浏览器，供管理员手动检测迟到的二维码。
+                qr_result = None
                 for qr_attempt in range(1, 11):
                     await answer_screenshot_requests("login", session_id, page)
                     if await redis_client.lpop(f"douyin:login:close:{session_id}"):
                         await close_browser(session_id, browser, context, p)
                         return
-                    for selector in qr_selectors:
-                        candidates = page.locator(selector)
-                        for index in range(await candidates.count()):
-                            candidate = candidates.nth(index)
-                            if not await candidate.is_visible():
-                                continue
-                            src = await candidate.get_attribute("src")
-                            if not src or not src.startswith("data:image/") or "," not in src:
-                                continue
-                            header, candidate_encoded = src.split(",", 1)
-                            candidate_mime = header.split(";", 1)[0][5:]
-                            try:
-                                decoded = base64.b64decode(candidate_encoded, validate=True)
-                                area = await candidate.evaluate("el => el.getBoundingClientRect().width * el.getBoundingClientRect().height")
-                            except Exception:
-                                continue
-                            if candidate_mime == "image/png" and decoded.startswith(b"\x89PNG") and len(decoded) > 500 and area > chosen_area:
-                                image = decoded
-                                mime = candidate_mime
-                                encoded = candidate_encoded
-                                chosen_area = area
-                    if image is not None:
+                    if await answer_login_qr_requests(session_id, page, session, db):
+                        qr_result = (session.qr_payload, "image/png", 0)
+                        break
+                    qr_result = await read_login_qr(page)
+                    if qr_result:
                         break
                     if qr_attempt < 10:
                         print(
@@ -894,17 +917,41 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
                                 f"[LoginWorker] 第 {qr_attempt + 1}/10 次重试未找到登录按钮，继续读取二维码",
                                 flush=True,
                             )
-                if image is None:
-                    raise RuntimeError("连续 10 次未读取到有效的抖音登录二维码 img.src")
-                print(
-                    f"[LoginWorker] 获取到登录二维码: mime={mime}, base64_length={len(encoded)}, area={chosen_area:.0f}",
-                    flush=True,
-                )
-                print("[LoginWorker] 已读取二维码 img.src", flush=True)
-                session.qr_payload = base64.b64encode(image).decode()
-                await db.commit()
-                print(f"[LoginWorker] 登录二维码已保存，会话 {session_id}，等待扫码", flush=True)
-                await publish(session.id, "qr", image=session.qr_payload, expires_at=session.expires_at.isoformat())
+                if qr_result is None:
+                    print(f"[LoginWorker] 连续 10 次未读取到二维码，会话 {session_id} 保持打开，等待手动检测", flush=True)
+                    while datetime.now() < session.expires_at:
+                        await answer_screenshot_requests("login", session_id, page)
+                        if await redis_client.lpop(f"douyin:login:close:{session_id}"):
+                            await close_browser(session_id, browser, context, p)
+                            return
+                        if await browser_window_closed(browser, context):
+                            session.status = "cancelled"
+                            session.completed_at = datetime.now()
+                            session.failure_reason = "浏览器窗口已关闭"
+                            await db.commit()
+                            await publish(session.id, "cancelled", reason=session.failure_reason)
+                            await stop_closed_browser(session_id, browser, context, p)
+                            return
+                        if await answer_login_qr_requests(session_id, page, session, db):
+                            qr_result = (session.qr_payload, "image/png", 0)
+                            break
+                        await asyncio.sleep(0.5)
+                if qr_result:
+                    encoded, mime, chosen_area = qr_result
+                    if session.qr_payload != encoded:
+                        session.qr_payload = encoded
+                        await db.commit()
+                        await publish(session.id, "qr", image=encoded, expires_at=session.expires_at.isoformat())
+                    print(f"[LoginWorker] 获取到登录二维码: mime={mime}, base64_length={len(encoded)}, area={chosen_area:.0f}", flush=True)
+                    print(f"[LoginWorker] 登录二维码已保存，会话 {session_id}，等待扫码", flush=True)
+                else:
+                    session.status = "expired"
+                    session.completed_at = datetime.now()
+                    await db.commit()
+                    await publish(session.id, "expired")
+                    print(f"[LoginWorker] 登录会话已过期，会话 {session_id}", flush=True)
+                    await wait_for_manual_close(session_id, browser, context, p, page)
+                    return
                 print(f"[LoginWorker] 已启动二次认证定时检测，会话 {session_id}，间隔 0.5 秒", flush=True)
                 deadline = session.expires_at.timestamp()
                 verification_detected = False
@@ -919,6 +966,7 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
                 last_probe_at = asyncio.get_running_loop().time()
                 while datetime.now().timestamp() < deadline:
                     await answer_screenshot_requests("login", session_id, page)
+                    await answer_login_qr_requests(session_id, page, session, db)
                     # 扫码等待期间也要响应后台关闭弹窗的操作。
                     close_requested = await redis_client.lpop(f"douyin:login:close:{session_id}")
                     if close_requested:

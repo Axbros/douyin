@@ -886,6 +886,36 @@ async def login_session_status(session_id: int, user: Annotated[User, Depends(ad
     return result
 
 
+@router.post("/douyin-login-sessions/{session_id}/detect-qr")
+async def detect_login_qr(session_id: int, user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    session = await db.scalar(select(AccountLoginSession).where(
+        AccountLoginSession.id == session_id, AccountLoginSession.deleted_at.is_(None),
+    ))
+    if not session:
+        raise HTTPException(404, "登录会话不存在")
+    if session.status != "waiting" or session.expires_at <= datetime.now():
+        raise HTTPException(409, "登录会话已结束，请重新发起扫码登录")
+    if session.qr_payload:
+        return {"found": True, "qr_payload": session.qr_payload}
+    if not await redis_client.exists(resource_key("login", session_id)):
+        raise HTTPException(409, "登录浏览器尚未启动或已关闭，请稍后重试")
+    request_id = token_urlsafe(18)
+    request_key = f"douyin:login:qr-request:{session_id}"
+    response_key = f"douyin:login:qr-response:{request_id}"
+    async with redis_client.pipeline(transaction=True) as pipe:
+        pipe.rpush(request_key, request_id)
+        pipe.expire(request_key, 20)
+        await pipe.execute()
+    item = await redis_client.blpop(response_key, timeout=12)
+    if not item:
+        raise HTTPException(504, "浏览器检测超时，请稍后重试")
+    result = json.loads(item[1])
+    if not result.get("found"):
+        return {"found": False, "message": "当前浏览器画面尚未出现有效的登录二维码"}
+    await db.refresh(session)
+    return {"found": True, "qr_payload": session.qr_payload}
+
+
 async def _request_browser_screenshot(browser_type: str, browser_id: str | int) -> Response:
     request_id = token_urlsafe(18)
     request_key = screenshot_request_key(browser_type, browser_id)
