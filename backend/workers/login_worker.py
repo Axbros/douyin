@@ -14,20 +14,104 @@ from datetime import datetime
 # 兼容仓库内较早生成的 protobuf 文件；必须在导入 src.platforms 前设置。
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
-from playwright.async_api import async_playwright
+from playwright.async_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError, async_playwright
 from sqlalchemy import select
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.core.crypto import decrypt_transient_secret, encrypt_storage_state
 from app.core.browser_preview import answer_screenshot_requests
 from app.core.database import SessionLocal, redis_client
-from app.core.proxy_pool import browser_proxy_for_account
+from app.core.login_browser_pool import LoginBrowserPool, PreparedBrowser
+from app.core.proxy_pool import browser_proxy_for_account, choose_proxy_for_new_account
 from app.core.proxy_tunnel import Socks5Bridge
 from app.models import AccountLoginSession, AccountLog, DouyinAccount
 from src.platforms import create_platform
 
 WORKER_HEARTBEAT_KEY = "douyin:login-worker:heartbeat"
 WORKER_HEARTBEAT_TTL_SECONDS = 300
+LOGIN_HOME_URL = "https://www.douyin.com/"
+LOGIN_FALLBACK_URL = "https://live.douyin.com/"
+
+
+async def login_home_usable(page) -> bool:
+    try:
+        if "验证码中间页" in await page.title():
+            return False
+        await page.get_by_text("登录", exact=True).first.wait_for(state="visible", timeout=5000)
+        return True
+    except Exception:
+        return False
+
+
+async def wait_for_optional_load(page) -> None:
+    # A few Douyin resources can keep `load` pending even after the login UI is ready.
+    try:
+        await page.wait_for_load_state("load", timeout=3000)
+    except PlaywrightTimeoutError:
+        pass
+
+
+async def dispose_prepared_browser(item: PreparedBrowser) -> None:
+    for resource in (item.context, item.browser, item.playwright):
+        if resource:
+            try:
+                await (resource.stop() if resource is item.playwright else resource.close())
+            except Exception:
+                pass
+    if item.proxy_bridge:
+        await item.proxy_bridge.close()
+
+
+async def prepare_login_browser(proxy_config: dict | None) -> PreparedBrowser:
+    """Navigate before the QR session; do not click Login or store account state."""
+    item = PreparedBrowser(None, None, None, None, proxy_config)
+    try:
+        if proxy_config:
+            item.proxy_bridge = Socks5Bridge(**proxy_config)
+            browser_proxy = await item.proxy_bridge.start()
+        else:
+            browser_proxy = None
+        item.playwright = await async_playwright().start()
+        item.browser = await item.playwright.chromium.launch(
+            headless=os.getenv("PLAYWRIGHT_HEADLESS", "false").lower() == "true",
+            proxy=browser_proxy,
+        )
+        item.context = await item.browser.new_context()
+        item.page = await item.context.new_page()
+        try:
+            await item.page.goto(LOGIN_HOME_URL, wait_until="domcontentloaded", timeout=20000)
+            await wait_for_optional_load(item.page)
+        except PlaywrightError as exc:
+            print(f"[LoginWorker] 抖音首页预热导航失败，尝试直播首页: {type(exc).__name__}", flush=True)
+        if not await login_home_usable(item.page):
+            print("[LoginWorker] 抖音首页没有可用登录入口，改用直播首页预热", flush=True)
+            await item.page.goto(LOGIN_FALLBACK_URL, wait_until="domcontentloaded", timeout=60000)
+            await wait_for_optional_load(item.page)
+            if not await login_home_usable(item.page):
+                raise RuntimeError("抖音首页及直播首页均未出现登录入口")
+        print("[LoginWorker] 备用 Chromium 已打开抖音首页，等待扫码登录任务", flush=True)
+        return item
+    except BaseException:
+        await dispose_prepared_browser(item)
+        raise
+
+
+async def initial_warm_proxy_config() -> dict | None:
+    """Prefer a pending account's proxy, then the proxy used by the next new account."""
+    async with SessionLocal() as db:
+        pending_accounts = list(await db.scalars(select(DouyinAccount).where(
+            DouyinAccount.deleted_at.is_(None), DouyinAccount.enabled.is_(True),
+            DouyinAccount.encrypted_storage_state.is_(None), DouyinAccount.proxy_id.is_not(None),
+        ).order_by(DouyinAccount.id.desc()).limit(20)))
+        for account in pending_accounts:
+            try:
+                return await browser_proxy_for_account(db, account)
+            except RuntimeError:
+                continue
+        proxy_id = await choose_proxy_for_new_account(db)
+        if proxy_id is None:
+            return None
+        return await browser_proxy_for_account(db, DouyinAccount(proxy_id=proxy_id))
 
 
 async def heartbeat():
@@ -98,11 +182,14 @@ async def wait_for_manual_close(session_id: int, browser, context, playwright, p
             return
 
 
-async def navigate_or_close(page, url: str, session_id: int, browser, context, playwright) -> bool:
+async def navigate_or_close(page, url: str, session_id: int, browser, context, playwright, timeout: int = 60000) -> bool:
     """导航期间同时监听关闭指令；返回 True 表示浏览器已被关闭。"""
-    # 必须等页面触发 load 事件后才允许点击登录按钮，避免页面初始化过程中
-    # 弹层或遮罩尚未稳定，导致点击落在旧节点上。
-    navigation = asyncio.create_task(page.goto(url, wait_until="load", timeout=60000))
+    # 完整 load 可能被第三方资源拖住；DOM、登录入口就绪后可继续。
+    async def load_login_page():
+        await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+        await wait_for_optional_load(page)
+
+    navigation = asyncio.create_task(load_login_page())
     closing = asyncio.create_task(redis_client.blpop(f"douyin:login:close:{session_id}", timeout=0))
     done, _ = await asyncio.wait({navigation, closing}, return_when=asyncio.FIRST_COMPLETED)
     if closing in done:
@@ -662,7 +749,7 @@ async def password_verification_error(container) -> str | None:
     return None
 
 
-async def run_session(session_id: int):
+async def run_session(session_id: int, browser_pool: LoginBrowserPool):
     print(f"[LoginWorker] 开始处理登录会话: {session_id}", flush=True)
     async with SessionLocal() as db:
         session = await db.scalar(select(AccountLoginSession).where(AccountLoginSession.id == session_id, AccountLoginSession.deleted_at.is_(None)))
@@ -672,11 +759,13 @@ async def run_session(session_id: int):
         if not account:
             return
         platform = create_platform("douyin")
-        p = await async_playwright().start()
+        p = None
         browser = None
         context = None
         page = None
         proxy_bridge = None
+        proxy_config = None
+        browser_claimed = False
         try:
             try:
                 proxy_config = await browser_proxy_for_account(db, account)
@@ -688,25 +777,42 @@ async def run_session(session_id: int):
                 await db.commit()
                 await publish(session.id, "failed", reason=session.failure_reason)
                 print(f"[LoginWorker] 会话 {session_id} 代理不可用: {exc}", flush=True)
-                await p.stop()
                 return
-            if proxy_config:
-                proxy_bridge = Socks5Bridge(**proxy_config)
-                browser_proxy = await proxy_bridge.start()
+            prepared = await browser_pool.claim(proxy_config)
+            if prepared:
+                p, browser, context, page, proxy_bridge = (
+                    prepared.playwright, prepared.browser, prepared.context,
+                    prepared.page, prepared.proxy_bridge,
+                )
+                browser_claimed = True
+                print(f"[LoginWorker] 复用已加载抖音首页的备用浏览器，会话 {session_id}", flush=True)
             else:
-                browser_proxy = None
-            # 与原桌面程序一致：默认打开可见浏览器，让管理员直接扫码。
-            # Linux 无桌面服务器由 Xvfb 提供虚拟屏幕，仍保持有界面模式以兼容页面行为。
-            browser = await p.chromium.launch(
-                headless=os.getenv("PLAYWRIGHT_HEADLESS", "false").lower() == "true",
-                proxy=browser_proxy,
-            )
-            print(f"[LoginWorker] Chromium 已启动，会话 {session_id}", flush=True)
-            context = await browser.new_context()
-            page = await context.new_page()
+                # 新代理或备用浏览器尚未准备好时，按账号绑定的代理启动。
+                # Linux 无桌面服务器由 Xvfb 提供虚拟屏幕。
+                if proxy_config:
+                    proxy_bridge = Socks5Bridge(**proxy_config)
+                    browser_proxy = await proxy_bridge.start()
+                else:
+                    browser_proxy = None
+                p = await async_playwright().start()
+                browser = await p.chromium.launch(
+                    headless=os.getenv("PLAYWRIGHT_HEADLESS", "false").lower() == "true",
+                    proxy=browser_proxy,
+                )
+                print(f"[LoginWorker] Chromium 已启动，会话 {session_id}", flush=True)
+                context = await browser.new_context()
+                page = await context.new_page()
             try:
-                if await navigate_or_close(page, platform.home_url, session_id, browser, context, p):
-                    return
+                if not browser_claimed:
+                    try:
+                        if await navigate_or_close(page, LOGIN_HOME_URL, session_id, browser, context, p, timeout=20000):
+                            return
+                    except PlaywrightError as exc:
+                        print(f"[LoginWorker] 抖音首页导航失败，尝试直播首页，会话 {session_id}: {type(exc).__name__}", flush=True)
+                    if not await login_home_usable(page):
+                        print(f"[LoginWorker] 抖音首页没有可用登录入口，改用直播首页，会话 {session_id}", flush=True)
+                        if await navigate_or_close(page, LOGIN_FALLBACK_URL, session_id, browser, context, p):
+                            return
                 print(f"[LoginWorker] 抖音页面加载完毕，会话 {session_id}，开始查找登录按钮", flush=True)
                 clicked = False
                 for _ in range(60):
@@ -1088,6 +1194,8 @@ async def run_session(session_id: int):
                         await db.commit()
                         await publish(session.id, "success", account_id=account.id)
                         print(f"[LoginWorker] 扫码登录成功，会话 {session_id}", flush=True)
+                        # Login window stays open for manual inspection; replenish the idle pool now.
+                        await browser_pool.retarget(proxy_config)
                         await wait_for_manual_close(session_id, browser, context, p, page)
                         account.status = "available" if account.enabled else "disabled"
                         await db.commit()
@@ -1112,18 +1220,32 @@ async def run_session(session_id: int):
                 await publish(session.id, "failed", reason=session.failure_reason)
                 print(f"[LoginWorker] 登录会话失败，会话 {session_id}: {session.failure_reason}", flush=True)
                 await wait_for_manual_close(session_id, browser, context, p, page)
-        except Exception:
+        except asyncio.CancelledError:
+            await dispose_prepared_browser(PreparedBrowser(p, browser, context, page, proxy_config, proxy_bridge))
+            proxy_bridge = None
+            raise
+        except Exception as exc:
             if browser:
                 print(f"[LoginWorker] Worker 内部异常，会话 {session_id}，浏览器仍保持打开", flush=True)
                 # 发生未预期异常时也保留浏览器，便于管理员检查页面并手动结束会话。
                 await wait_for_manual_close(session_id, browser, context, p, page)
             else:
                 # Chromium 尚未启动时没有可保留的浏览器，释放 Playwright 驱动。
-                await p.stop()
-                raise
+                if p:
+                    await p.stop()
+                session.status = "failed"
+                session.failure_reason = f"{type(exc).__name__}: {exc}"[:500]
+                account.last_error = session.failure_reason
+                db.add(AccountLog(account_id=account.id, event_type="login_failed", detail={"session_id": session.id, "reason": session.failure_reason}))
+                await db.commit()
+                await publish(session.id, "failed", reason=session.failure_reason)
+                print(f"[LoginWorker] 浏览器启动失败，会话 {session_id}: {session.failure_reason}", flush=True)
         finally:
             if proxy_bridge:
                 await proxy_bridge.close()
+            if browser_claimed:
+                # Cancelled and failed logins also consume the prepared browser.
+                await browser_pool.replenish(proxy_config)
 
 
 async def reconcile_interrupted_sessions():
@@ -1152,6 +1274,13 @@ async def main():
     print("[LoginWorker] 已启动，正在连接 Redis...", flush=True)
     await redis_client.ping()
     await reconcile_interrupted_sessions()
+    browser_pool = LoginBrowserPool(prepare_login_browser, dispose_prepared_browser)
+    try:
+        initial_proxy = await initial_warm_proxy_config()
+    except Exception as exc:
+        print(f"[LoginWorker] 读取预热代理失败，将预热直连浏览器: {type(exc).__name__}: {exc}", flush=True)
+        initial_proxy = None
+    await browser_pool.initialize(initial_proxy)
     print("[LoginWorker] Redis 已连接，等待扫码登录任务...", flush=True)
     heartbeat_task = asyncio.create_task(heartbeat())
     running_sessions: dict[int, asyncio.Task] = {}
@@ -1172,7 +1301,7 @@ async def main():
                     session_id = int(item[1])
                     if session_id in running_sessions:
                         continue
-                    task = asyncio.create_task(run_session(session_id))
+                    task = asyncio.create_task(run_session(session_id, browser_pool))
                     running_sessions[session_id] = task
                     task.add_done_callback(lambda finished, sid=session_id: session_finished(sid, finished))
             except Exception as exc:
@@ -1185,6 +1314,7 @@ async def main():
         for task in running_sessions.values():
             task.cancel()
         await asyncio.gather(*running_sessions.values(), return_exceptions=True)
+        await browser_pool.close()
         await redis_client.delete(WORKER_HEARTBEAT_KEY)
 
 

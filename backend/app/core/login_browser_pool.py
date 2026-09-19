@@ -1,0 +1,96 @@
+"""FIFO pool for already opened, unauthenticated Douyin login browsers."""
+import asyncio
+from collections import deque
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable
+
+
+@dataclass
+class PreparedBrowser:
+    playwright: Any
+    browser: Any
+    context: Any
+    page: Any
+    proxy_config: dict | None
+    proxy_bridge: Any = None
+
+
+class LoginBrowserPool:
+    def __init__(self, prepare: Callable[[dict | None], Awaitable[PreparedBrowser]],
+                 dispose: Callable[[PreparedBrowser], Awaitable[None]], size: int = 2):
+        self.prepare = prepare
+        self.dispose = dispose
+        self.size = size
+        self.ready: deque[PreparedBrowser] = deque()
+        self.pending: dict[asyncio.Task, dict | None] = {}
+        self.disposing: set[asyncio.Task] = set()
+        self.lock = asyncio.Lock()
+        self.closed = False
+
+    async def initialize(self, proxy_config: dict | None) -> None:
+        # gather preserves launch order even when page loads finish out of order.
+        results = await asyncio.gather(
+            *(self.prepare(proxy_config) for _ in range(self.size)), return_exceptions=True
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                print(f"[LoginWorker] 预热浏览器失败: {type(result).__name__}: {result}", flush=True)
+            else:
+                self.ready.append(result)
+        print(f"[LoginWorker] 预热浏览器就绪: {len(self.ready)}/{self.size}", flush=True)
+
+    async def claim(self, proxy_config: dict | None) -> PreparedBrowser | None:
+        async with self.lock:
+            for item in list(self.ready):
+                if item.proxy_config == proxy_config:
+                    self.ready.remove(item)
+                    if item.browser.is_connected() and not item.page.is_closed():
+                        print(f"[LoginWorker] 领取预热浏览器，剩余 {len(self.ready)} 个", flush=True)
+                        return item
+                    await self.dispose(item)
+        return None
+
+    async def replenish(self, proxy_config: dict | None) -> None:
+        async with self.lock:
+            while not self.closed and len(self.ready) + len(self.pending) < self.size:
+                task = asyncio.create_task(self.prepare(proxy_config))
+                self.pending[task] = proxy_config
+                task.add_done_callback(self._prepared)
+
+    async def retarget(self, proxy_config: dict | None) -> None:
+        """After a login, make the two idle slots useful for the next account."""
+        async with self.lock:
+            stale = [item for item in self.ready if item.proxy_config != proxy_config]
+            self.ready = deque(item for item in self.ready if item.proxy_config == proxy_config)
+            stale_pending = [task for task, config in self.pending.items() if config != proxy_config]
+            for task in stale_pending:
+                task.cancel()
+        await asyncio.gather(*stale_pending, return_exceptions=True)
+        await asyncio.gather(*(self.dispose(item) for item in stale))
+        await self.replenish(proxy_config)
+
+    def _prepared(self, task: asyncio.Task) -> None:
+        self.pending.pop(task, None)
+        if task.cancelled():
+            return
+        try:
+            item = task.result()
+        except Exception as exc:
+            print(f"[LoginWorker] 补充预热浏览器失败: {type(exc).__name__}: {exc}", flush=True)
+            return
+        if self.closed:
+            disposal = asyncio.create_task(self.dispose(item))
+            self.disposing.add(disposal)
+            disposal.add_done_callback(self.disposing.discard)
+        else:
+            self.ready.append(item)
+            print(f"[LoginWorker] 已补充预热浏览器，现有 {len(self.ready)} 个", flush=True)
+
+    async def close(self) -> None:
+        self.closed = True
+        for task in list(self.pending):
+            task.cancel()
+        await asyncio.gather(*self.pending, return_exceptions=True)
+        while self.ready:
+            await self.dispose(self.ready.popleft())
+        await asyncio.gather(*self.disposing, return_exceptions=True)

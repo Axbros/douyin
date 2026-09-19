@@ -7,6 +7,7 @@ class Socks5Bridge:
         self.host, self.port = host, port
         self.username, self.password = username, password
         self.server: asyncio.AbstractServer | None = None
+        self.connections: set[asyncio.Task] = set()
 
     async def start(self) -> dict:
         self.server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
@@ -17,9 +18,16 @@ class Socks5Bridge:
         if self.server:
             self.server.close()
             await self.server.wait_closed()
+        connections = list(self.connections)
+        for task in connections:
+            task.cancel()
+        await asyncio.gather(*connections, return_exceptions=True)
 
     async def _handle(self, local_reader, local_writer):
+        handler = asyncio.current_task()
+        self.connections.add(handler)
         upstream_writer = None
+        pipes = []
         try:
             version, count = await asyncio.wait_for(local_reader.readexactly(2), 15)
             methods = await local_reader.readexactly(count)
@@ -83,12 +91,12 @@ class Socks5Bridge:
                 except (ConnectionError, OSError):
                     pass
 
-            tasks = [asyncio.create_task(pipe(local_reader, upstream_writer)),
+            pipes = [asyncio.create_task(pipe(local_reader, upstream_writer)),
                      asyncio.create_task(pipe(upstream_reader, local_writer))]
-            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            done, pending = await asyncio.wait(pipes, return_when=asyncio.FIRST_COMPLETED)
             for task in pending:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*pipes, return_exceptions=True)
         except (asyncio.IncompleteReadError, ConnectionError, OSError, TimeoutError, ValueError):
             try:
                 local_writer.write(b"\x05\x01\x00\x01" + b"\x00" * 6)
@@ -96,6 +104,10 @@ class Socks5Bridge:
             except (ConnectionError, OSError):
                 pass
         finally:
+            for task in pipes:
+                task.cancel()
+            await asyncio.gather(*pipes, return_exceptions=True)
             local_writer.close()
             if upstream_writer:
                 upstream_writer.close()
+            self.connections.discard(handler)
