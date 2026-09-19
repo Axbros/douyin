@@ -13,6 +13,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.core.crypto import decrypt_storage_state
 from app.core.proxy_pool import browser_proxy_for_account
 from app.core.proxy_tunnel import Socks5Bridge
+from app.core.browser_preview import answer_screenshot_requests
+from app.core.browser_resources import remove_resource, resource_heartbeat
 from app.core.database import SessionLocal, redis_client
 from app.core.worker_registry import heartbeat_worker, mark_worker_offline, register_worker
 from app.models import AccountLog, CommentLog, DouyinAccount, Script, SensitiveWord, Task, TaskAccount, TaskScript
@@ -36,14 +38,16 @@ async def heartbeat(worker_id: int):
         await asyncio.sleep(5)
 
 
-async def wait_for_assignment_stop(assignment_id: int, seconds: float) -> bool:
+async def wait_for_assignment_stop(assignment_id: int, seconds: float, page=None) -> bool:
     """等待评论间隔，同时让移除账号/停止任务最多 2 秒内生效。"""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + seconds
     while loop.time() < deadline:
+        if page:
+            await answer_screenshot_requests("task", assignment_id, page)
         if await redis_client.lpop(f"douyin:task-account:stop:{assignment_id}"):
             return True
-        await asyncio.sleep(min(2, max(0, deadline - loop.time())))
+        await asyncio.sleep(min(1, max(0, deadline - loop.time())))
     return bool(await redis_client.lpop(f"douyin:task-account:stop:{assignment_id}"))
 
 
@@ -133,6 +137,7 @@ async def run_account(task_id: int, assignment_id: int, account_id: int, live_ur
     platform = create_platform("douyin")
     playwright = browser = context = None
     proxy_bridge = None
+    resource_task = None
     failed = False
     login_expired = False
     claimed = False
@@ -161,6 +166,7 @@ async def run_account(task_id: int, assignment_id: int, account_id: int, live_ur
         )
         context = await browser.new_context(storage_state=state)
         page = await context.new_page()
+        resource_task = asyncio.create_task(resource_heartbeat("task", assignment_id, page, account_id=account_id, task_id=task_id))
         await page.goto(live_url, wait_until="domcontentloaded", timeout=30000)
         if not await platform.check_logged_in(page, context):
             raise LoginStateExpired("登录状态已失效，请重新扫码登录")
@@ -184,6 +190,9 @@ async def run_account(task_id: int, assignment_id: int, account_id: int, live_ur
             "max_length": 500,
         }, platform=platform)
         while True:
+            await answer_screenshot_requests("task", assignment_id, page)
+            if not browser.is_connected() or page.is_closed():
+                raise RuntimeError("任务浏览器窗口已关闭")
             async with SessionLocal() as db:
                 task = await db.get(Task, task_id)
                 if not task or task.status in {"stopped", "failed", "completed"}:
@@ -196,10 +205,12 @@ async def run_account(task_id: int, assignment_id: int, account_id: int, live_ur
                     account_row.status = "paused" if task_status == "paused" else "busy"
                     await db.commit()
             if task_status == "paused" or not scripts:
+                if await redis_client.lpop(f"douyin:task-account:stop:{assignment_id}"):
+                    break
                 await asyncio.sleep(2)
                 continue
             interrupted = await wait_for_assignment_stop(
-                assignment_id, random.uniform(min_interval, max_interval)
+                assignment_id, random.uniform(min_interval, max_interval), page
             )
             if interrupted:
                 break
@@ -277,6 +288,13 @@ async def run_account(task_id: int, assignment_id: int, account_id: int, live_ur
                 db.add(AccountLog(account_id=account_id, event_type="login_expired" if login_expired else "task_error", detail={"task_id": task_id, "reason": account.last_error}))
             await db.commit()
     finally:
+        if resource_task:
+            resource_task.cancel()
+            await asyncio.gather(resource_task, return_exceptions=True)
+            try:
+                await remove_resource("task", assignment_id)
+            except Exception:
+                pass
         if context:
             try:
                 await context.close()

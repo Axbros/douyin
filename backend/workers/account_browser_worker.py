@@ -11,6 +11,7 @@ from app.core.crypto import decrypt_storage_state
 from app.core.proxy_pool import browser_proxy_for_account
 from app.core.proxy_tunnel import Socks5Bridge
 from app.core.browser_preview import answer_screenshot_requests
+from app.core.browser_resources import remove_resource, resource_heartbeat
 from app.core.database import SessionLocal, redis_client
 from app.models import AccountLog, DouyinAccount
 from src.platforms import create_platform
@@ -30,6 +31,7 @@ async def run_account_browser(account_id: int, active: set[int]):
     active.add(account_id)
     playwright = browser = context = None
     proxy_bridge = None
+    resource_task = None
     failed = False
     opened = False
     try:
@@ -51,6 +53,7 @@ async def run_account_browser(account_id: int, active: set[int]):
         )
         context = await browser.new_context(storage_state=state)
         page = await context.new_page()
+        resource_task = asyncio.create_task(resource_heartbeat("account", account_id, page, account_id=account_id))
         platform = create_platform("douyin")
         await page.goto(platform.home_url, wait_until="domcontentloaded", timeout=30000)
         if not await platform.check_logged_in(page, context):
@@ -64,6 +67,8 @@ async def run_account_browser(account_id: int, active: set[int]):
             opened = True
         print(f"[AccountBrowserWorker] 账号 {account_id} 浏览器已唤醒，已恢复登录状态", flush=True)
         while True:
+            if not browser.is_connected() or page.is_closed():
+                break
             await answer_screenshot_requests("account", account_id, page)
             if await redis_client.blpop(f"douyin:account-browser:close:{account_id}", timeout=1):
                 break
@@ -82,6 +87,13 @@ async def run_account_browser(account_id: int, active: set[int]):
                 db.add(AccountLog(account_id=account_id, event_type="login_expired" if isinstance(exc, LoginStateExpired) else "browser_error", detail={"reason": account.last_error}))
                 await db.commit()
     finally:
+        if resource_task:
+            resource_task.cancel()
+            await asyncio.gather(resource_task, return_exceptions=True)
+            try:
+                await remove_resource("account", account_id)
+            except Exception:
+                pass
         if context:
             try:
                 await context.close()

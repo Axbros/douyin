@@ -6,7 +6,7 @@ import json
 from app.core.database import redis_client
 
 
-def screenshot_request_key(browser_type: str, browser_id: int) -> str:
+def screenshot_request_key(browser_type: str, browser_id: str | int) -> str:
     return f"douyin:browser-preview:request:{browser_type}:{browser_id}"
 
 
@@ -14,7 +14,7 @@ def screenshot_response_key(request_id: str) -> str:
     return f"douyin:browser-preview:response:{request_id}"
 
 
-async def answer_screenshot_requests(browser_type: str, browser_id: int, page) -> None:
+async def answer_screenshot_requests(browser_type: str, browser_id: str | int, page) -> None:
     """处理当前浏览器的全部待处理截图请求。"""
     request_key = screenshot_request_key(browser_type, browser_id)
     while request_id := await redis_client.lpop(request_key):

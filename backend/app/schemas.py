@@ -305,6 +305,19 @@ class ProxyTestResponse(BaseModel):
     checked_at: datetime
 
 
+class BrowserResourceResponse(BaseModel):
+    kind: str
+    resource_id: str
+    account_id: int | None = None
+    account_name: str | None = None
+    task_id: int | None = None
+    opened_at: datetime
+    heartbeat_at: datetime
+    url: str = ""
+    hostname: str = ""
+    process_id: int | None = None
+
+
 class ProxyResponse(BaseModel):
     id: int
     domain: str

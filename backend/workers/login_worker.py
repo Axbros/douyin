@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import re
+import socket
 import sys
 from datetime import datetime
 
@@ -20,6 +21,7 @@ from sqlalchemy import select
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.core.crypto import decrypt_transient_secret, encrypt_storage_state
 from app.core.browser_preview import answer_screenshot_requests
+from app.core.browser_resources import pool_command_key, remove_resource, resource_heartbeat, touch_resource
 from app.core.database import SessionLocal, redis_client
 from app.core.login_browser_pool import LoginBrowserPool, PreparedBrowser
 from app.core.proxy_pool import browser_proxy_for_account, choose_proxy_for_new_account
@@ -764,6 +766,7 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
         context = None
         page = None
         proxy_bridge = None
+        resource_task = None
         proxy_config = None
         browser_claimed = False
         try:
@@ -780,6 +783,7 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
                 return
             prepared = await browser_pool.claim(proxy_config)
             if prepared:
+                await remove_resource("warm", prepared.resource_id)
                 p, browser, context, page, proxy_bridge = (
                     prepared.playwright, prepared.browser, prepared.context,
                     prepared.page, prepared.proxy_bridge,
@@ -802,6 +806,7 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
                 print(f"[LoginWorker] Chromium 已启动，会话 {session_id}", flush=True)
                 context = await browser.new_context()
                 page = await context.new_page()
+            resource_task = asyncio.create_task(resource_heartbeat("login", session_id, page, account_id=account.id))
             try:
                 if not browser_claimed:
                     try:
@@ -1241,6 +1246,13 @@ async def run_session(session_id: int, browser_pool: LoginBrowserPool):
                 await publish(session.id, "failed", reason=session.failure_reason)
                 print(f"[LoginWorker] 浏览器启动失败，会话 {session_id}: {session.failure_reason}", flush=True)
         finally:
+            if resource_task:
+                resource_task.cancel()
+                await asyncio.gather(resource_task, return_exceptions=True)
+                try:
+                    await remove_resource("login", session_id)
+                except Exception:
+                    pass
             if proxy_bridge:
                 await proxy_bridge.close()
             if browser_claimed:
@@ -1283,7 +1295,9 @@ async def main():
     await browser_pool.initialize(initial_proxy)
     print("[LoginWorker] Redis 已连接，等待扫码登录任务...", flush=True)
     heartbeat_task = asyncio.create_task(heartbeat())
+    targeted_pool_commands = pool_command_key(socket.gethostname(), os.getpid())
     running_sessions: dict[int, asyncio.Task] = {}
+    registered_warm_ids: set[str] = set()
 
     def session_finished(session_id: int, task: asyncio.Task):
         running_sessions.pop(session_id, None)
@@ -1296,8 +1310,32 @@ async def main():
     try:
         while True:
             try:
-                item = await redis_client.blpop("douyin:login:sessions", timeout=5)
+                for resource_id in await browser_pool.prune_closed():
+                    await remove_resource("warm", resource_id)
+                ready = list(browser_pool.ready)
+                current_warm_ids = {prepared.resource_id for prepared in ready}
+                for resource_id in registered_warm_ids - current_warm_ids:
+                    await remove_resource("warm", resource_id)
+                registered_warm_ids = current_warm_ids
+                for prepared in ready:
+                    await touch_resource("warm", prepared.resource_id, opened_at=prepared.opened_at, url=prepared.page.url)
+                    await answer_screenshot_requests("warm", prepared.resource_id, prepared.page)
+                item = await redis_client.blpop(
+                    [targeted_pool_commands, "douyin:login:pool:commands", "douyin:login:sessions"], timeout=1
+                )
                 if item:
+                    queue_name = item[0].decode() if isinstance(item[0], bytes) else item[0]
+                    if queue_name in {targeted_pool_commands, "douyin:login:pool:commands"}:
+                        command = json.loads(item[1])
+                        if command.get("action") == "close":
+                            resource_id = str(command.get("resource_id", ""))
+                            if await browser_pool.close_slot(resource_id):
+                                await remove_resource("warm", resource_id)
+                                print(f"[LoginWorker] 已手动关闭备用浏览器 {resource_id}", flush=True)
+                        elif command.get("action") == "open":
+                            await browser_pool.open_slot(await initial_warm_proxy_config())
+                            print("[LoginWorker] 已请求打开备用浏览器", flush=True)
+                        continue
                     session_id = int(item[1])
                     if session_id in running_sessions:
                         continue
@@ -1314,7 +1352,10 @@ async def main():
         for task in running_sessions.values():
             task.cancel()
         await asyncio.gather(*running_sessions.values(), return_exceptions=True)
+        warm_ids = [item.resource_id for item in browser_pool.ready]
         await browser_pool.close()
+        for resource_id in warm_ids:
+            await remove_resource("warm", resource_id)
         await redis_client.delete(WORKER_HEARTBEAT_KEY)
 
 

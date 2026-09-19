@@ -15,6 +15,33 @@ class FakePage:
 
 
 class LoginBrowserPoolTest(unittest.IsolatedAsyncioTestCase):
+    async def test_manual_close_and_open_change_idle_capacity(self):
+        created = []
+        disposed = []
+
+        async def prepare(config):
+            item = PreparedBrowser(len(created) + 1, FakeBrowser(), None, FakePage(), config)
+            created.append(item)
+            return item
+
+        async def dispose(item):
+            disposed.append(item.resource_id)
+
+        pool = LoginBrowserPool(prepare, dispose)
+        await pool.initialize(None)
+        first_id = pool.ready[0].resource_id
+        self.assertTrue(await pool.close_slot(first_id))
+        self.assertFalse(await pool.close_slot(first_id))
+        self.assertEqual(pool.desired_size, 1)
+        await pool.replenish(None)
+        self.assertEqual(len(pool.ready), 1)
+        await pool.open_slot(None)
+        await asyncio.gather(*list(pool.pending))
+        self.assertEqual(len(pool.ready), 2)
+        self.assertEqual(pool.desired_size, 2)
+        self.assertIn(first_id, disposed)
+        await pool.close()
+
     async def test_fifo_replenish_and_proxy_isolation(self):
         created = []
         disposed = []

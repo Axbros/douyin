@@ -36,6 +36,13 @@ const browserPreviewTitle = ref('当前浏览器画面')
 const browserPreviewPath = ref('')
 const accounts = ref<any[]>([])
 const proxies = ref<any[]>([])
+const browserResources = ref<any[]>([])
+const browserResourcesLoading = ref(false)
+const resourceAccountId = ref<number | null>(null)
+const resourceActionKey = ref('')
+const resourceKindFilter = ref('')
+const filteredBrowserResources = computed(() => browserResources.value.filter(item => !resourceKindFilter.value || item.kind === resourceKindFilter.value))
+let browserResourcesTimer: number | null = null
 const proxyKeyword = ref('')
 const filteredProxies = computed(() => proxies.value.filter(item => !proxyKeyword.value.trim() || `${item.domain} ${item.port} ${item.username}`.toLowerCase().includes(proxyKeyword.value.trim().toLowerCase())))
 const proxyDialogVisible = ref(false)
@@ -252,7 +259,7 @@ function searchCustomers() { customerPage.value = 1 }
 function searchScripts() { scriptPage.value = 1 }
 function resetCustomerQuery() { customerKeyword.value = ''; customerStatus.value = ''; customerPage.value = 1 }
 function resetScriptQuery() { scriptKeyword.value = ''; scriptStatus.value = 'pending_review'; scriptPage.value = 1 }
-function selectMenu(value: string) { active.value = value; if (value === 'server') loadServerStatus(); if (value === 'settings') loadPlatformSettings('/api/admin/platform-settings') }
+function selectMenu(value: string) { active.value = value; if (value === 'server') loadServerStatus(); if (value === 'settings') loadPlatformSettings('/api/admin/platform-settings'); if (value === 'resources') { load(); loadBrowserResources() } }
 function customerName(customerId: number) { return customers.value.find(item => item.id === customerId)?.display_name || `客户 ${customerId}` }
 function viewCustomerTasks(row: any) { taskCustomerId.value = row.id; taskKeyword.value = ''; taskStatus.value = ''; taskPage.value = 1; active.value = 'tasks' }
 
@@ -384,7 +391,7 @@ async function loadServerStatus() {
     notify('服务器监控接口暂时不可用', 'error')
   } finally { serverLoading.value = false }
 }
-function refreshAdmin() { active.value === 'server' ? loadServerStatus() : load() }
+function refreshAdmin() { active.value === 'server' ? loadServerStatus() : active.value === 'resources' ? (load(), loadBrowserResources()) : load() }
 function formatBytes(value: number | undefined) {
   if (value === undefined || value === null) return '—'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
@@ -535,6 +542,54 @@ function showLoginBrowserPreview() {
 }
 function showAccountBrowserPreview(row: any) {
   showBrowserPreview(`/api/admin/douyin-accounts/${row.id}/browser/screenshot`, `${row.display_name} · 浏览器画面`)
+}
+function resourceKindText(kind: string) { return ({ warm: '备用登录浏览器', login: '扫码登录', account: '账号调试', task: '任务执行' } as Record<string, string>)[kind] || kind }
+async function loadBrowserResources(showError = true) {
+  if (browserResourcesLoading.value) return
+  browserResourcesLoading.value = true
+  try {
+    const response = await fetch('/api/admin/browser-resources', { headers: authHeaders() })
+    if (response.ok) browserResources.value = await response.json()
+    else if (showError) notify((await response.json()).detail || '获取浏览器资源失败', 'error')
+  } catch { if (showError) notify('获取浏览器资源失败', 'error') }
+  finally { browserResourcesLoading.value = false }
+}
+function showResourcePreview(row: any) {
+  showBrowserPreview(`/api/admin/browser-resources/${row.kind}/${row.resource_id}/screenshot`, `${row.account_name || resourceKindText(row.kind)} · 浏览器画面`)
+}
+async function openSelectedAccountBrowser() {
+  if (!resourceAccountId.value) return
+  const accountId = resourceAccountId.value
+  resourceActionKey.value = 'account-open'
+  try {
+    const response = await fetch(`/api/admin/douyin-accounts/${accountId}/browser/open`, { method: 'POST', headers: authHeaders() })
+    if (!response.ok) { notify((await response.json()).detail || '打开浏览器失败', 'error'); return }
+    resourceAccountId.value = null; notify('账号浏览器正在启动', 'success')
+    window.setTimeout(() => { load(); loadBrowserResources(false) }, 1800)
+  } finally { resourceActionKey.value = '' }
+}
+async function openWarmResource() {
+  resourceActionKey.value = 'warm-open'
+  try {
+    const response = await fetch('/api/admin/browser-resources/warm/open', { method: 'POST', headers: authHeaders() })
+    if (!response.ok) { notify((await response.json()).detail || '打开备用浏览器失败', 'error'); return }
+    notify('备用登录浏览器正在启动', 'success')
+    window.setTimeout(() => loadBrowserResources(false), 1800)
+  } finally { resourceActionKey.value = '' }
+}
+async function closeBrowserResource(row: any) {
+  if (row.kind === 'task') {
+    const confirmed = await ElMessageBox.confirm('关闭任务浏览器会移除此账号的当前任务分配，确定继续吗？', '关闭任务浏览器', { type: 'warning' }).catch(() => false)
+    if (!confirmed) return
+  }
+  const key = `${row.kind}:${row.resource_id}`
+  resourceActionKey.value = key
+  try {
+    const response = await fetch(`/api/admin/browser-resources/${row.kind}/${row.resource_id}/close`, { method: 'POST', headers: authHeaders() })
+    if (!response.ok) { notify((await response.json()).detail || '关闭浏览器失败', 'error'); return }
+    notify('浏览器关闭指令已发送', 'success')
+    window.setTimeout(() => { load(); loadBrowserResources(false) }, 1400)
+  } finally { resourceActionKey.value = '' }
 }
 function normalizeVerificationCode(value: string) { verificationCode.value = String(value).replace(/\D/g, '').slice(0, 6) }
 async function submitVerificationCode() {
@@ -1053,10 +1108,14 @@ onMounted(() => {
   serverStatusTimer = window.setInterval(() => {
     if (token.value && role.value === 'admin' && active.value === 'server') loadServerStatus()
   }, 5000)
+  browserResourcesTimer = window.setInterval(() => {
+    if (token.value && role.value === 'admin' && active.value === 'resources') loadBrowserResources(false)
+  }, 5000)
 })
 onUnmounted(() => {
   if (countdownTimer) window.clearInterval(countdownTimer)
   if (serverStatusTimer) window.clearInterval(serverStatusTimer)
+  if (browserResourcesTimer) window.clearInterval(browserResourcesTimer)
   clearBrowserPreview()
 })
 if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus()]) : loadCustomer()
@@ -1106,6 +1165,7 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
           <el-menu-item index="customers"><el-icon><UserFilled /></el-icon><span>客户管理</span></el-menu-item>
           <el-menu-item index="accounts"><el-icon><Avatar /></el-icon><span>抖音账号</span></el-menu-item>
           <el-menu-item index="proxies"><el-icon><Connection /></el-icon><span>代理池</span></el-menu-item>
+          <el-menu-item index="resources"><el-icon><Monitor /></el-icon><span>资源管理</span></el-menu-item>
           <el-menu-item index="scripts"><el-icon><ChatDotRound /></el-icon><span>话术审核</span></el-menu-item>
           <el-menu-item index="tasks"><el-icon><Operation /></el-icon><span>直播任务</span></el-menu-item>
           <el-menu-item index="words"><el-icon><Warning /></el-icon><span>敏感词管理</span></el-menu-item>
@@ -1186,6 +1246,30 @@ if (token.value) role.value === 'admin' ? Promise.all([load(), loadServerStatus(
               <el-table-column label="检测时间" min-width="180"><template #default="{ row }">{{ formatDate(row.test_result?.checked_at) }}</template></el-table-column>
               <el-table-column label="已绑定/默认容量" width="140"><template #default="{ row }">{{ row.account_count }}/{{ row.max_accounts }}</template></el-table-column>
               <el-table-column label="操作" width="295" fixed="right"><template #default="{ row }"><el-button link type="primary" :loading="proxyTestingId === row.id" @click="testProxy(row)">测速</el-button><el-button link type="primary" @click="showProxyAccounts(row)">抖音号</el-button><el-button link type="primary" @click="openProxyDialog(row)">编辑</el-button><el-button link type="danger" @click="deleteProxy(row)">删除</el-button></template></el-table-column>
+            </el-table>
+          </el-card>
+        </template>
+
+        <template v-else-if="active === 'resources'">
+          <el-card shadow="never" style="margin-bottom: 12px">
+            <div class="query-title">浏览器操作</div>
+            <el-form inline class="queryForm">
+              <el-form-item label="账号浏览器"><el-select v-model="resourceAccountId" filterable clearable placeholder="选择已登录的闲置账号" style="width: 260px"><el-option v-for="account in accounts.filter(item => item.enabled && item.status === 'available' && item.last_login_at)" :key="account.id" :label="account.display_name" :value="account.id" /></el-select></el-form-item>
+              <el-form-item><el-button type="primary" :disabled="!resourceAccountId" :loading="resourceActionKey === 'account-open'" @click="openSelectedAccountBrowser">打开账号浏览器</el-button><el-button :loading="resourceActionKey === 'warm-open'" :disabled="browserResources.filter(item => item.kind === 'warm').length >= 2" @click="openWarmResource">打开备用登录浏览器</el-button></el-form-item>
+            </el-form>
+            <el-form inline class="queryForm"><el-form-item label="浏览器类型"><el-select v-model="resourceKindFilter" clearable placeholder="全部类型" style="width:180px"><el-option label="备用登录" value="warm" /><el-option label="扫码登录" value="login" /><el-option label="账号调试" value="account" /><el-option label="任务执行" value="task" /></el-select></el-form-item></el-form>
+          </el-card>
+          <el-card shadow="never">
+            <div class="table-toolbar"><div class="table-title">运行中的 Chromium</div><div class="record-total">共 {{ filteredBrowserResources.length }} 个窗口 · 每 5 秒刷新</div><el-button :icon="Refresh" :loading="browserResourcesLoading" @click="loadBrowserResources()">刷新</el-button></div>
+            <el-table v-loading="browserResourcesLoading" :data="filteredBrowserResources" border stripe empty-text="暂无运行中的浏览器">
+              <el-table-column type="index" label="序号" width="70" />
+              <el-table-column label="类型" width="150"><template #default="{ row }"><el-tag :type="row.kind === 'task' ? 'warning' : row.kind === 'warm' ? 'info' : 'primary'">{{ resourceKindText(row.kind) }}</el-tag></template></el-table-column>
+              <el-table-column label="抖音账号" min-width="150"><template #default="{ row }">{{ row.account_name || (row.kind === 'warm' ? '未分配' : '—') }}</template></el-table-column>
+              <el-table-column label="当前任务" width="110"><template #default="{ row }">{{ row.task_id ? '执行中' : '—' }}</template></el-table-column>
+              <el-table-column label="当前页面" min-width="220" show-overflow-tooltip><template #default="{ row }">{{ row.url || '页面加载中' }}</template></el-table-column>
+              <el-table-column label="打开时间" width="180"><template #default="{ row }">{{ formatDate(row.opened_at) }}</template></el-table-column>
+              <el-table-column label="最近心跳" width="180"><template #default="{ row }">{{ formatDate(row.heartbeat_at) }}</template></el-table-column>
+              <el-table-column label="操作" width="190" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="showResourcePreview(row)">查看画面</el-button><el-button link type="danger" :loading="resourceActionKey === `${row.kind}:${row.resource_id}`" @click="closeBrowserResource(row)">关闭</el-button></template></el-table-column>
             </el-table>
           </el-card>
         </template>

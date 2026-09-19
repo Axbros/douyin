@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.database import redis_client
 from app.core.browser_preview import screenshot_request_key, screenshot_response_key
+from app.core.browser_resources import list_resources, pool_command_key, resource_key
 from app.core.crypto import decrypt_transient_secret, encrypt_transient_secret
 from app.core.proxy_pool import choose_proxy_for_new_account
 from app.core.proxy_speed import measure_proxy
@@ -38,6 +39,7 @@ from app.schemas import (
     AdminCustomerStatusUpdate,
     AdminCustomerUpdate,
     AdminScriptResponse,
+    BrowserResourceResponse,
     CommentLogResponse,
     DouyinAccountUpdate,
     LoginSessionResponse,
@@ -884,7 +886,7 @@ async def login_session_status(session_id: int, user: Annotated[User, Depends(ad
     return result
 
 
-async def _request_browser_screenshot(browser_type: str, browser_id: int) -> Response:
+async def _request_browser_screenshot(browser_type: str, browser_id: str | int) -> Response:
     request_id = token_urlsafe(18)
     request_key = screenshot_request_key(browser_type, browser_id)
     response_key = screenshot_response_key(request_id)
@@ -937,6 +939,75 @@ async def account_browser_screenshot(
     if account.status != "browser_open":
         raise HTTPException(409, "该账号的调试浏览器没有运行")
     return await _request_browser_screenshot("account", account.id)
+
+
+@router.get("/browser-resources", response_model=list[BrowserResourceResponse])
+async def browser_resources(user: Annotated[User, Depends(admin_user)], db: Annotated[AsyncSession, Depends(get_db)]):
+    items = await list_resources()
+    account_ids = {item["account_id"] for item in items if item.get("account_id")}
+    names = {}
+    if account_ids:
+        accounts = await db.scalars(select(DouyinAccount).where(DouyinAccount.id.in_(account_ids)))
+        names = {account.id: account.display_name for account in accounts}
+    for item in items:
+        item["account_name"] = names.get(item.get("account_id"))
+    return items
+
+
+@router.get("/browser-resources/{kind}/{resource_id}/screenshot")
+async def browser_resource_screenshot(kind: str, resource_id: str, user: Annotated[User, Depends(admin_user)]):
+    if kind not in {"warm", "login", "account", "task"}:
+        raise HTTPException(404, "浏览器类型不存在")
+    if not await redis_client.exists(resource_key(kind, resource_id)):
+        raise HTTPException(404, "浏览器已关闭或心跳已过期")
+    return await _request_browser_screenshot(kind, resource_id)
+
+
+@router.post("/browser-resources/warm/open", status_code=202)
+async def open_warm_browser(user: Annotated[User, Depends(admin_user)]):
+    if not await redis_client.exists(WORKER_HEARTBEAT_KEYS["扫码登录 Worker"]):
+        raise HTTPException(503, "扫码登录 Worker 未运行")
+    await redis_client.rpush("douyin:login:pool:commands", json.dumps({"action": "open"}))
+    return {"message": "备用浏览器打开指令已发送"}
+
+
+@router.post("/browser-resources/{kind}/{resource_id}/close", status_code=202)
+async def close_browser_resource(kind: str, resource_id: str, user: Annotated[User, Depends(admin_user)],
+                                 db: Annotated[AsyncSession, Depends(get_db)]):
+    if kind not in {"warm", "login", "account", "task"}:
+        raise HTTPException(404, "浏览器类型不存在")
+    if kind != "warm" and not resource_id.isdigit():
+        raise HTTPException(422, "浏览器标识无效")
+    resource_data = await redis_client.get(resource_key(kind, resource_id))
+    if not resource_data:
+        raise HTTPException(404, "浏览器已关闭或心跳已过期")
+    if kind == "warm":
+        owner = json.loads(resource_data)
+        await redis_client.rpush(pool_command_key(owner["hostname"], owner["process_id"]),
+                                 json.dumps({"action": "close", "resource_id": resource_id}))
+    elif kind == "login":
+        await close_login_session(int(resource_id), user, db)
+    elif kind == "account":
+        await close_account_browser(int(resource_id), user, db)
+    else:
+        assignment = await db.get(TaskAccount, int(resource_id))
+        if not assignment or assignment.status not in {"assigned", "running"}:
+            raise HTTPException(409, "任务账号已经停止")
+        await remove_task_account(assignment.task_id, assignment.account_id, user, db)
+        db.add(AccountLog(account_id=assignment.account_id, event_type="task_browser_closed_by_admin",
+                          detail={"task_id": assignment.task_id, "admin_id": user.id}))
+        remaining = await db.scalar(select(TaskAccount.id).where(
+            TaskAccount.task_id == assignment.task_id,
+            TaskAccount.status.in_(("assigned", "running")),
+            TaskAccount.deleted_at.is_(None),
+        ).limit(1))
+        if not remaining:
+            task = await db.get(Task, assignment.task_id)
+            if task and task.status in {"running", "paused"}:
+                task.status = "stopped"
+                task.stopped_at = datetime.now()
+        await db.commit()
+    return {"message": "浏览器关闭指令已发送"}
 
 
 @router.post("/douyin-login-sessions/{session_id}/verification-method", status_code=202)

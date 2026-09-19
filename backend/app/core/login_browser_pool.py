@@ -1,8 +1,10 @@
 """FIFO pool for already opened, unauthenticated Douyin login browsers."""
 import asyncio
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Awaitable, Callable
+from uuid import uuid4
 
 
 @dataclass
@@ -13,6 +15,8 @@ class PreparedBrowser:
     page: Any
     proxy_config: dict | None
     proxy_bridge: Any = None
+    resource_id: str = field(default_factory=lambda: uuid4().hex)
+    opened_at: str = field(default_factory=lambda: datetime.now().isoformat())
 
 
 class LoginBrowserPool:
@@ -21,6 +25,7 @@ class LoginBrowserPool:
         self.prepare = prepare
         self.dispose = dispose
         self.size = size
+        self.desired_size = size
         self.ready: deque[PreparedBrowser] = deque()
         self.pending: dict[asyncio.Task, dict | None] = {}
         self.disposing: set[asyncio.Task] = set()
@@ -50,9 +55,39 @@ class LoginBrowserPool:
                     await self.dispose(item)
         return None
 
+    async def close_slot(self, resource_id: str) -> bool:
+        async with self.lock:
+            item = next((entry for entry in self.ready if entry.resource_id == resource_id), None)
+            if item is None:
+                return False
+            self.ready.remove(item)
+            self.desired_size = max(0, self.desired_size - 1)
+            excess = max(0, len(self.ready) + len(self.pending) - self.desired_size)
+            surplus_tasks = list(self.pending)[-excess:] if excess else []
+            for task in surplus_tasks:
+                task.cancel()
+        await asyncio.gather(*surplus_tasks, return_exceptions=True)
+        await self.dispose(item)
+        return True
+
+    async def open_slot(self, proxy_config: dict | None) -> None:
+        async with self.lock:
+            self.desired_size = min(self.size, self.desired_size + 1)
+        await self.replenish(proxy_config)
+
+    async def prune_closed(self) -> list[str]:
+        async with self.lock:
+            stale = [item for item in self.ready if not item.browser.is_connected() or item.page.is_closed()]
+            for item in stale:
+                self.ready.remove(item)
+        await asyncio.gather(*(self.dispose(item) for item in stale))
+        if stale:
+            await self.replenish(stale[0].proxy_config)
+        return [item.resource_id for item in stale]
+
     async def replenish(self, proxy_config: dict | None) -> None:
         async with self.lock:
-            while not self.closed and len(self.ready) + len(self.pending) < self.size:
+            while not self.closed and len(self.ready) + len(self.pending) < self.desired_size:
                 task = asyncio.create_task(self.prepare(proxy_config))
                 self.pending[task] = proxy_config
                 task.add_done_callback(self._prepared)
